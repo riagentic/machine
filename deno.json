@@ -1,0 +1,40 @@
+{
+  "name": "machine",
+  "version": "0.1.0",
+  "exports": "./src/app.ts",
+  "nodeModulesDir": "auto",
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "jsxImportSource": "aio",
+    "lib": ["deno.ns", "deno.unstable", "dom", "dom.iterable"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true
+  },
+  "imports": {
+    "aio": "./dep/aio/mod.ts",
+    "aio/air": "./dep/aio/src/air.ts",
+    "aio/jsx-runtime": "./dep/aio/src/jsx-runtime.ts",
+    "aio/testing": "./dep/aio/src/cell-test.ts",
+    "aio/build": "./dep/aio/src/build.ts",
+    "aio/am": "./dep/aio/src/am.ts",
+    "aio/doctor": "./dep/aio/src/server/doctor.ts",
+    "@std/assert": "jsr:@std/assert@^1",
+    "@std/path": "jsr:@std/path@^1",
+    "electron": "npm:electron@^41",
+    "immer": "npm:immer@^10"
+  },
+  "tasks": {
+    "dev": "deno run -A src/app.ts",
+    "dev:browser": "deno run -A src/app.ts --client=browser",
+    "am": "deno run -A dep/aio/src/am.ts",
+    "test": "deno test -A test/",
+    "wasm": "deno run -A rust/build.ts",
+    "install:electron": "deno install --allow-scripts=npm:electron",
+    "compile": "deno run -A dep/aio/src/build.ts --compile",
+    "compile:electron": "deno run -A dep/aio/src/build.ts --compile --electron",
+    "compile:android": "deno run -A dep/aio/src/build.ts --android",
+    "doctor": "deno run -A dep/aio/src/server/doctor.ts"
+  },
+  "fmt": { "exclude": ["dep/", "rust/pkg/", "rust/target/", "dist/"] },
+  "lint": { "exclude": ["dep/", "rust/", "dist/"] }
+}

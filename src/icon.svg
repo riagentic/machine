@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512"
+  height="512">
+  <defs>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#9945FF" />
+      <stop offset="0.55" stop-color="#DC1FFF" />
+      <stop offset="1" stop-color="#00C2FF" />
+    </linearGradient>
+    <radialGradient id="bg" cx="0.5" cy="0.35" r="0.9">
+      <stop offset="0" stop-color="#16162A" />
+      <stop offset="0.6" stop-color="#0B0B12" />
+      <stop offset="1" stop-color="#07070F" />
+    </radialGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#9945FF" stop-opacity="0.35" />
+      <stop offset="0.7" stop-color="#9945FF" stop-opacity="0.08" />
+      <stop offset="1" stop-color="#9945FF" stop-opacity="0" />
+    </radialGradient>
+    <filter id="pulseGlow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="7" result="b" />
+      <feMerge>
+        <feMergeNode in="b" />
+        <feMergeNode in="SourceGraphic" />
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- dark rounded-square tile -->
+  <rect x="16" y="16" width="480" height="480" rx="112" fill="url(#bg)" />
+  <rect x="16" y="16" width="480" height="480" rx="112" fill="none"
+    stroke="#23233B" stroke-width="6" />
+  <circle cx="256" cy="248" r="210" fill="url(#glow)" />
+
+  <!-- CPU pins -->
+  <g stroke="url(#accent)" stroke-width="18" stroke-linecap="round">
+    <path d="M196 108v-32 M256 108v-32 M316 108v-32" />
+    <path d="M196 404v32 M256 404v32 M316 404v32" />
+    <path d="M108 196h-32 M108 256h-32 M108 316h-32" />
+    <path d="M404 196h32 M404 256h32 M404 316h32" />
+  </g>
+
+  <!-- CPU body -->
+  <rect x="118" y="118" width="276" height="276" rx="44"
+    fill="#12121F" stroke="url(#accent)" stroke-width="18" />
+  <!-- inner die -->
+  <rect x="164" y="164" width="184" height="184" rx="26"
+    fill="none" stroke="#23233B" stroke-width="8" />
+
+  <!-- live pulse trace across the die -->
+  <path d="M140 256h56l22-58 34 116 26-88 18 30h76"
+    fill="none" stroke="#14F195" stroke-width="18"
+    stroke-linecap="round" stroke-linejoin="round"
+    filter="url(#pulseGlow)" />
+</svg>

@@ -1,0 +1,32 @@
+# build artifacts
+dist/
+rust/pkg/
+rust/target/
+node_modules/
+*.AppImage
+AppDir/
+
+# compiled wasm — regenerated via `deno task wasm` (needs Rust + wasm32 target)
+src/syscalls.wasm
+
+# aio runtime state
+.aio/
+.aio-*/
+data.db
+*.db
+*.db-*
+
+# logs
+*.log
+
+# vendored framework — local symlink to a sibling aio checkout (see README).
+# Not committed: it resolves to a path outside the repo.
+dep/
+
+# katas — global-rule symlinks resolve outside the repo (machine.md is kept)
+.katana/_*.md
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
