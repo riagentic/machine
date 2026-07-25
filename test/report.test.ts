@@ -8,14 +8,18 @@ import {
   cleanHw,
   computeHealth,
   cpuReport,
+  groupPorts,
   type HealthInput,
   lspciReport,
   pciEmoji,
   type ReportInput,
+  secReport,
+  secScore,
   shortVendor,
   todoReport,
   usbEmoji,
 } from "../src/App.tsx";
+import type { NetInfo, SecInfo } from "../src/wasm.ts";
 
 // ── device string cleaning ─────────────────────────────────────────────────
 
@@ -54,6 +58,7 @@ const empty: HealthInput = {
   gpu: null,
   net: null,
   sys: null,
+  sec: null,
   wasmAvailable: true,
 };
 
@@ -125,6 +130,183 @@ Deno.test("computeHealth ranks critical before warning", () => {
   assertEquals(issues[0]?.sev, "crit");
 });
 
+// ── security: score, report, health issues ─────────────────────────────────
+
+const netUp: NetInfo = {
+  addrs: [],
+  links: [],
+  vpn: true,
+  firewall: { backend: "nftables", active: true },
+  default_route: "default via 192.168.1.1",
+  speed: { link_max_mbps: 0, rx_mbps: 0, tx_mbps: 0 },
+};
+
+const check = (id: string, ok: boolean): SecInfo["checks"][number] => ({
+  id,
+  label: id,
+  value: ok ? "good" : "bad",
+  ok,
+  hint: `hint for ${id}`,
+});
+
+const hardened: SecInfo = {
+  ports: [
+    {
+      proto: "tcp",
+      addr: "127.0.0.1",
+      port: 631,
+      process: "cupsd",
+      exposed: false,
+    },
+  ],
+  procs: [],
+  checks: [check("aslr", true), check("ssh_root", true)],
+};
+
+Deno.test("secScore: hardened box with firewall+vpn scores 100", () => {
+  assertEquals(secScore(hardened, netUp), 100);
+});
+
+Deno.test("secScore: exposure, threats, and failed checks each cost points", () => {
+  const weak: SecInfo = {
+    ports: [
+      {
+        proto: "tcp",
+        addr: "0.0.0.0",
+        port: 22,
+        process: "sshd",
+        exposed: true,
+      },
+      {
+        proto: "tcp",
+        addr: "0.0.0.0",
+        port: 5900,
+        process: "vnc",
+        exposed: true,
+      },
+    ],
+    procs: [{
+      pid: 7,
+      user: "bob",
+      cmd: "/tmp/x",
+      reason: "world-writable dir",
+    }],
+    checks: [check("aslr", true), check("ssh_root", false)],
+  };
+  const noNet: NetInfo = {
+    ...netUp,
+    vpn: false,
+    firewall: { backend: "none", active: false },
+  };
+  // checks 25/50 + ports 12/20 + procs 0/15 + fw 0 + vpn 0
+  assertEquals(secScore(weak, noNet), 37);
+  assertEquals(secScore(null, netUp), 0);
+  // unknown never punishes: zero checks keep the full checks weight
+  assertEquals(secScore({ ports: [], procs: [], checks: [] }, netUp), 100);
+});
+
+Deno.test("groupPorts collapses per-process floods, exposed first", () => {
+  const mk = (port: number, process: string, exposed: boolean) => ({
+    proto: "tcp",
+    addr: exposed ? "0.0.0.0" : "127.0.0.1",
+    port,
+    process,
+    exposed,
+  });
+  const groups = groupPorts([
+    mk(8000, "validator", false),
+    mk(8001, "validator", false),
+    mk(8002, "validator", false),
+    mk(22, "sshd", true),
+    mk(5353, "", true), // no process name → proto label
+  ]);
+  assertEquals(groups.length, 3);
+  // exposed groups lead
+  assert(groups[0]?.exposed && groups[1]?.exposed);
+  assert(groups.some((g) => g.label === "sshd:22"));
+  assert(groups.some((g) => g.label === "tcp:5353"));
+  assertEquals(groups.find((g) => !g.exposed)?.label, "validator ×3");
+});
+
+Deno.test("secReport lists checks with ✓/✗ and exposure", () => {
+  const out = secReport(hardened, netUp);
+  assertStringIncludes(out, "## Security");
+  assertStringIncludes(out, "Score: 100/100");
+  assertStringIncludes(out, "✓ aslr");
+  assertStringIncludes(out, "tcp/631 cupsd");
+  assertStringIncludes(secReport(null, null), "no data");
+});
+
+Deno.test("computeHealth: security posture feeds the TODO list", () => {
+  const issues = computeHealth({
+    ...empty,
+    sec: {
+      ports: [
+        {
+          proto: "tcp",
+          addr: "0.0.0.0",
+          port: 22,
+          process: "sshd",
+          exposed: true,
+        },
+      ],
+      procs: [
+        { pid: 9, user: "bob", cmd: "/tmp/x", reason: "world-writable dir" },
+      ],
+      checks: [
+        check("ssh_pass", false),
+        check("kptr", false),
+        check("bpf", false),
+      ],
+    },
+  });
+  // suspicious process = crit, ranked first
+  assertEquals(issues[0]?.sev, "crit");
+  assertStringIncludes(issues[0]?.text ?? "", "Suspicious process 9");
+  assert(
+    issues.some((i) => i.sev === "sec" && /open to the network/.test(i.text)),
+  );
+  // loud check (ssh_pass) gets its own line; quiet ones aggregate
+  assert(issues.some((i) => /ssh_pass/.test(i.text)));
+  assert(issues.some((i) => /2 kernel hardening gaps/.test(i.text)));
+});
+
+Deno.test("computeHealth: no swap only warns under memory pressure", () => {
+  const sys = {
+    hostname: "",
+    kernel: "",
+    arch: "",
+    os: "linux",
+    uptime_s: 60,
+    load1: 0,
+    load5: 0,
+    load15: 0,
+    procs_running: 0,
+    procs_total: 0,
+    cpu_mhz: 0,
+    cpu_max_mhz: 0,
+    swap_total_kb: 0,
+    swap_used_kb: 0,
+    reboot_required: false,
+    governor: "",
+  };
+  const mem = (used: number) => ({
+    total_kb: 100,
+    available_kb: 100 - used,
+    used_kb: used,
+    used_pct: used,
+    temp_c: 0,
+  });
+  assert(
+    computeHealth({ ...empty, sys, mem: mem(75) })
+      .some((i) => /No swap/.test(i.text)),
+  );
+  assert(
+    !computeHealth({ ...empty, sys, mem: mem(30) })
+      .some((i) => /No swap/.test(i.text)),
+  );
+});
+
 // ── report builders ────────────────────────────────────────────────────────
 
 Deno.test("cpuReport renders a markdown block with the key facts", () => {
@@ -171,6 +353,7 @@ Deno.test("report builders never throw on all-null state", () => {
     disk: null,
     net: null,
     sys: null,
+    sec: null,
     lspci: [],
     lsusb: [],
   };

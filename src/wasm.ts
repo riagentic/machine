@@ -84,6 +84,34 @@ export type NetInfo = {
   speed: { link_max_mbps: number; rx_mbps: number; tx_mbps: number };
 };
 
+// Security posture — parsed by the Rust sys_sec syscall. Checks whose input
+// is unavailable are OMITTED by the parser (never reported as failing).
+export type SecCheck = {
+  id: string;
+  label: string;
+  value: string;
+  ok: boolean;
+  hint: string;
+};
+export type SecPort = {
+  proto: string;
+  addr: string;
+  port: number;
+  process: string;
+  exposed: boolean; // bound beyond loopback — reachable from the network
+};
+export type SecProc = {
+  pid: number;
+  user: string;
+  cmd: string;
+  reason: string;
+};
+export type SecInfo = {
+  ports: SecPort[];
+  procs: SecProc[];
+  checks: SecCheck[];
+};
+
 // Host identity + live vitals — collected host-side (no WASM parser). Every
 // field is best-effort; 0/"" means "unavailable", never an error.
 export type SysInfo = {
@@ -102,6 +130,7 @@ export type SysInfo = {
   swap_total_kb: number;
   swap_used_kb: number;
   reboot_required: boolean; // pending kernel/package update needs a reboot
+  governor: string; // cpufreq scaling governor ("" = unavailable)
 };
 
 // ── cell: machine ─────────────────────────────────────────────────────────
@@ -132,6 +161,7 @@ export type MachineState = {
   lsusb: LsusbEntry[];
   net: NetInfo | null;
   sys: SysInfo | null;
+  sec: SecInfo | null;
 };
 
 // Compute CPU utilization % from two consecutive /proc/stat "cpu" lines.
@@ -179,6 +209,7 @@ export const machine = cell("machine", {
     lsusb: [],
     net: null,
     sys: null,
+    sec: null,
   } as MachineState,
   methods: {
     // `force` is passed by the manual refresh button so a paused app can still
@@ -248,6 +279,7 @@ export const machine = cell("machine", {
         s.lsusb = snap.lsusb;
         s.net = snap.net;
         s.sys = snap.sys;
+        s.sec = snap.sec;
         // (CPU history is owned by refreshCpu — the 1s sampler — so the
         // sparkline stays strictly per-second; no push here.)
         const anyNull = !snap.cpu || !snap.mem || !snap.board || !snap.gpu ||

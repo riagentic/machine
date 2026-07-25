@@ -12,7 +12,7 @@ import { machine } from "./wasm.ts";
 
 await aio.run({
   appId: "machine",
-  appVersion: "0.1.0",
+  appVersion: "0.2.0",
   cells: [machine],
   persist: false, // hardware state is live, not persisted
   // Hardware reads (lspci/lsusb/df/ip) are inherently I/O-bound (50-300ms).

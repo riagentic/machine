@@ -28,6 +28,7 @@
 - HW List integrated (lspci, etc.)
 - Hw List plugged (lsusb, etc.)
 - Network information (ip addresses, vpn info, firewal info)
+- Security posture (listening ports, suspicious processes, hardening settings)
 
 ## CPU
 
@@ -52,6 +53,22 @@
 - show model
 - shows utilization
 - shows memory utilization
+
+## Security
+
+- security card shows a 0-100 posture score (ring gauge): hardening checks 50 ·
+  open-port exposure 20 · clean process list 15 · firewall 10 · vpn 5
+- hardening checks: ASLR, ptrace scope, kptr/dmesg restrict, IP forwarding,
+  unprivileged BPF, SSH root login, SSH password auth, Secure Boot, disk
+  encryption, pending updates
+- a check whose input is unreadable is OMITTED, never shown as failing (no false
+  alarms on locked-down boxes)
+- listening ports shown as pills: 🌐 exposed (bound beyond loopback) vs 🔒
+  loopback-only
+- suspicious processes (world-writable exec dirs, cryptominers, netcat
+  listeners, reverse-shell patterns) are CRIT issues in the TODO card
+- all judgment lives in the Rust parser (pure, fixture-tested); the host only
+  gathers text (ss/ps//proc/sys/sshd_config/mokutil/lsblk)
 
 ## Temperature
 

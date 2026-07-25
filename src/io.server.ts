@@ -17,6 +17,7 @@ import type {
   LsusbEntry,
   MemInfo,
   NetInfo,
+  SecInfo,
   SysInfo,
 } from "./wasm.ts";
 
@@ -30,6 +31,7 @@ export type {
   LsusbEntry,
   MemInfo,
   NetInfo,
+  SecInfo,
   SysInfo,
 };
 
@@ -83,6 +85,18 @@ type WasmExports = {
     sil: number,
   ) => number;
   sys_dimms: (raw: number, len: number) => number;
+  sys_sec: (
+    ss: number,
+    ssl: number,
+    ps: number,
+    psl: number,
+    sysctl: number,
+    syl: number,
+    sshd: number,
+    shl: number,
+    facts: number,
+    fal: number,
+  ) => number;
 };
 
 let _exports: WasmExports | null = null;
@@ -711,6 +725,7 @@ export async function sys(): Promise<SysInfo> {
     swap_total_kb: 0,
     swap_used_kb: 0,
     reboot_required: false,
+    governor: "",
   };
   try {
     base.hostname = Deno.hostname();
@@ -750,6 +765,9 @@ export async function sys(): Promise<SysInfo> {
     "/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq",
   );
   base.cpu_max_mhz = (parseInt(maxFreq.trim()) || 0) / 1000;
+  base.governor = (await readFile(
+    "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor",
+  )).trim();
 
   const meminfo = await readFile("/proc/meminfo");
   const swTotal = parseInt(meminfo.match(/SwapTotal:\s*(\d+)/)?.[1] ?? "0") ||
@@ -768,6 +786,111 @@ async function detectFirewallState(): Promise<string> {
   }
   if (await runCmd(["firewall-cmd", "--state"])) return "firewalld";
   return "none";
+}
+
+// ── sec: security posture inputs (ports, processes, hardening facts) ───────
+// The host only GATHERS text here; all judgment lives in the Rust sys_sec
+// parser (pure, fixture-tested). Every input is best-effort: an unreadable
+// source becomes "" and the parser OMITS the affected check — a locked-down
+// box degrades to fewer checks, never to false alarms.
+
+// /proc/sys files feeding the hardening checks — "short-key path" pairs; the
+// parser looks the short keys up in the "key value" block we assemble.
+const SYSCTL_CHECKS: readonly [string, string][] = [
+  ["randomize_va_space", "/proc/sys/kernel/randomize_va_space"],
+  ["ptrace_scope", "/proc/sys/kernel/yama/ptrace_scope"],
+  ["kptr_restrict", "/proc/sys/kernel/kptr_restrict"],
+  ["dmesg_restrict", "/proc/sys/kernel/dmesg_restrict"],
+  ["ip_forward", "/proc/sys/net/ipv4/ip_forward"],
+  ["unprivileged_bpf_disabled", "/proc/sys/kernel/unprivileged_bpf_disabled"],
+];
+
+async function secFactsLinux(): Promise<string> {
+  const facts: string[] = [];
+  // Secure Boot — mokutil is the portable answer; efivars fallback needs root.
+  const mok = await runCmd(["mokutil", "--sb-state"]);
+  facts.push(
+    `secureboot ${
+      mok.includes("enabled")
+        ? "enabled"
+        : mok.includes("disabled")
+        ? "disabled"
+        : "unknown"
+    }`,
+  );
+  // Disk encryption — any `crypt` row in lsblk means a LUKS/dm-crypt volume.
+  const lsblk = await runCmd(["lsblk", "-rno", "TYPE"]);
+  facts.push(`luks ${lsblk ? (lsblk.includes("crypt") ? "1" : "0") : "-1"}`);
+  // Pending updates — Ubuntu/Debian update-notifier stamp ("N updates can be
+  // applied"). Missing file = unknown (-1), never 0: absence isn't "patched".
+  const upd = await readFile("/var/lib/update-notifier/updates-available");
+  const m = upd.match(/(\d+)\s+update/);
+  facts.push(`updates ${m ? m[1] : "-1"}`);
+  return facts.join("\n");
+}
+
+export async function sec(): Promise<SecInfo | null> {
+  if (PLATFORM === "linux") {
+    const [ss, ps, sshd, facts, ...sysctlVals] = await Promise.all([
+      runCmd(["ss", "-tulnpH"]),
+      runCmd(["ps", "-eo", "pid=,user=,args="]),
+      readFile("/etc/ssh/sshd_config"),
+      secFactsLinux(),
+      ...SYSCTL_CHECKS.map(([, path]) => readFile(path)),
+    ]);
+    const sysctl = SYSCTL_CHECKS
+      .map(([key], i) => [key, (sysctlVals[i] ?? "").trim()] as const)
+      .filter(([, v]) => v !== "")
+      .map(([k, v]) => `${k} ${v}`)
+      .join("\n");
+    return call<SecInfo>("sys_sec", [ss, ps, sysctl, sshd, facts]);
+  }
+  if (PLATFORM === "windows") {
+    // netstat -ano LISTENING rows → synthesized ss rows (no process names —
+    // resolving PIDs would need one query per row).
+    const netstat = await runCmd(["netstat", "-ano"]);
+    const ss = netstat.split("\n")
+      .filter((l) => l.includes("LISTENING"))
+      .map((l) => {
+        const c = l.trim().split(/\s+/);
+        return `tcp LISTEN 0 0 ${c[1] ?? ""} *:*`;
+      }).join("\n");
+    const sb = await runCmd([
+      "powershell",
+      "-NoProfile",
+      "-Command",
+      "Confirm-SecureBootUEFI",
+    ]);
+    const facts = `secureboot ${
+      sb.includes("True")
+        ? "enabled"
+        : sb.includes("False")
+        ? "disabled"
+        : "unknown"
+    }`;
+    return call<SecInfo>("sys_sec", [ss, "", "", "", facts]);
+  }
+  // darwin — lsof for listeners, csrutil (SIP), fdesetup (FileVault)
+  const lsof = await runCmd(["lsof", "-iTCP", "-sTCP:LISTEN", "-P", "-n"]);
+  const ss = lsof.split("\n").slice(1).map((l) => {
+    const c = l.trim().split(/\s+/);
+    const addr = c[8] ?? "";
+    return c.length > 8 ? `tcp LISTEN 0 0 ${addr} *:* users:(("${c[0]}"))` : "";
+  }).filter(Boolean).join("\n");
+  const sip = await runCmd(["csrutil", "status"]);
+  const fv = await runCmd(["fdesetup", "status"]);
+  const facts = [
+    // SIP ≈ the closest analog to Secure Boot's "tampered boot chain" check
+    `secureboot ${
+      sip.includes("enabled")
+        ? "enabled"
+        : sip.includes("disabled")
+        ? "disabled"
+        : "unknown"
+    }`,
+    `luks ${fv.includes("On") ? "1" : fv.includes("Off") ? "0" : "-1"}`,
+  ].join("\n");
+  return call<SecInfo>("sys_sec", [ss, "", "", "", facts]);
 }
 
 // ── collectAll: run every syscall in parallel, return one bundle ───────────
@@ -791,23 +914,36 @@ export type HardwareSnapshot = Pick<
   | "lsusb"
   | "net"
   | "sys"
+  | "sec"
 >;
 
 export async function collectAll(): Promise<HardwareSnapshot> {
-  const [cpuV, memV, dimmsV, boardV, gpuV, diskV, lspciV, lsusbV, netV, sysV] =
-    await Promise
-      .all([
-        cpu(),
-        mem(),
-        dimms(),
-        board(),
-        gpu(),
-        disk(),
-        lspci(),
-        lsusb(),
-        net(),
-        sys(),
-      ]);
+  const [
+    cpuV,
+    memV,
+    dimmsV,
+    boardV,
+    gpuV,
+    diskV,
+    lspciV,
+    lsusbV,
+    netV,
+    sysV,
+    secV,
+  ] = await Promise
+    .all([
+      cpu(),
+      mem(),
+      dimms(),
+      board(),
+      gpu(),
+      disk(),
+      lspci(),
+      lsusb(),
+      net(),
+      sys(),
+      sec(),
+    ]);
   return {
     cpu: cpuV,
     mem: memV,
@@ -820,5 +956,6 @@ export async function collectAll(): Promise<HardwareSnapshot> {
     lsusb: lsusbV ?? [],
     net: netV,
     sys: sysV,
+    sec: secV,
   };
 }

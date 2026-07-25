@@ -57,6 +57,7 @@ testUI(App, "panels render all hardware sections", async (ui) => {
       "MOTHERBOARD",
       "GPU",
       "DISK",
+      "SECURITY",
       "NETWORK",
       "LSPCI",
       "LSUSB",

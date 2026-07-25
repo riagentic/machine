@@ -17,6 +17,7 @@ import type {
   MachineState,
   MemInfo,
   NetInfo,
+  SecInfo,
   SysInfo,
 } from "./wasm.ts";
 
@@ -168,7 +169,7 @@ const SEV: Record<Sev, { color: string; tag: string; rank: number }> = {
 // with plain literals — the live `machine` cell satisfies them structurally.
 export type HealthInput = Pick<
   MachineState,
-  "cpu" | "mem" | "disk" | "gpu" | "net" | "sys" | "wasmAvailable"
+  "cpu" | "mem" | "disk" | "gpu" | "net" | "sys" | "sec" | "wasmAvailable"
 >;
 export type ReportInput = Pick<
   MachineState,
@@ -181,6 +182,7 @@ export type ReportInput = Pick<
   | "disk"
   | "net"
   | "sys"
+  | "sec"
   | "lspci"
   | "lsusb"
 >;
@@ -292,12 +294,80 @@ export function computeHealth(s: HealthInput): Issue[] {
       text: "VPN down — traffic unencrypted",
     });
   }
+  if (s.sec) {
+    // Compromise indicators are critical; posture gaps are SEC suggestions.
+    for (const p of s.sec.procs) {
+      out.push({
+        sev: "crit",
+        icon: "☠",
+        text: `Suspicious process ${p.pid} (${p.user}) — ${p.reason}`,
+      });
+    }
+    const exposed = s.sec.ports.filter((p) => p.exposed);
+    if (exposed.length > 0) {
+      const names = [
+        ...new Set(exposed.map((p) => p.process || String(p.port))),
+      ];
+      out.push({
+        sev: "sec",
+        icon: "🚪",
+        text: `${exposed.length} port${
+          exposed.length > 1 ? "s" : ""
+        } open to the network — ${names.slice(0, 4).join(", ")}${
+          names.length > 4 ? "…" : ""
+        }`,
+      });
+    }
+    // High-impact single checks get their own line; the rest aggregate.
+    const failed = s.sec.checks.filter((c) => !c.ok);
+    const loud = ["ssh_root", "ssh_pass", "secboot", "luks", "updates"];
+    for (const c of failed.filter((c) => loud.includes(c.id))) {
+      out.push({
+        sev: c.id === "updates" ? "warn" : "sec",
+        icon: c.id === "updates" ? "📦" : "🔑",
+        text: `${c.label}: ${c.value} — ${c.hint}`,
+      });
+    }
+    const quiet = failed.filter((c) => !loud.includes(c.id));
+    if (quiet.length > 0) {
+      out.push({
+        sev: "sec",
+        icon: "🧱",
+        text: `${quiet.length} kernel hardening gap${
+          quiet.length > 1 ? "s" : ""
+        } — ${quiet.map((c) => c.label).join(", ")}`,
+      });
+    }
+  }
   // ── software / maintenance ──
   if (s.sys?.reboot_required) {
     out.push({
       sev: "warn",
       icon: "🔄",
       text: "Reboot required — updates pending",
+    });
+  }
+  if (s.net && s.net.default_route === "") {
+    out.push({
+      sev: "warn",
+      icon: "🛰",
+      text: "No default route — machine looks offline",
+    });
+  }
+  if (s.sys && s.cpu && s.cpu.cores > 0 && s.sys.load15 > s.cpu.cores) {
+    out.push({
+      sev: "warn",
+      icon: "🐢",
+      text: `Sustained load — 15m avg ${
+        s.sys.load15.toFixed(1)
+      } over ${s.cpu.cores} threads`,
+    });
+  }
+  if (s.sys && s.sys.swap_total_kb === 0 && s.mem && s.mem.used_pct >= 70) {
+    out.push({
+      sev: "info",
+      icon: "🧯",
+      text: "No swap configured — OOM kills hit without warning",
     });
   }
   if (s.sys && s.sys.uptime_s > 30 * 86400) {
@@ -432,6 +502,52 @@ export const netReport = (info: NetInfo | null): string =>
     li("Interfaces", summarizeAddrs(info.addrs).replace(/\n/g, "; ")),
   ]);
 
+// ── security score ──────────────────────────────────────────────────────────
+// Pure 0-100 posture score. Unknown never punishes: with zero checks the
+// checks slice contributes its full weight (a locked-down box that exposes
+// nothing scores well, it doesn't fail for being unreadable).
+//   checks 50 · ports 20 (−4/exposed) · clean procs 15 · firewall 10 · vpn 5
+export const secScore = (sec: SecInfo | null, net: NetInfo | null): number => {
+  if (!sec) return 0;
+  const total = sec.checks.length;
+  const passed = sec.checks.filter((c) => c.ok).length;
+  const checkPts = total > 0 ? (passed / total) * 50 : 50;
+  const exposed = sec.ports.filter((p) => p.exposed).length;
+  const portPts = Math.max(0, 20 - exposed * 4);
+  const procPts = sec.procs.length === 0 ? 15 : 0;
+  const fwPts = net?.firewall.active ? 10 : 0;
+  const vpnPts = net?.vpn ? 5 : 0;
+  return Math.round(checkPts + portPts + procPts + fwPts + vpnPts);
+};
+
+export const secReport = (sec: SecInfo | null, net: NetInfo | null): string =>
+  !sec ? rpt("Security", [li("status", "no data")]) : rpt("Security", [
+    li("Score", `${secScore(sec, net)}/100`),
+    ...sec.checks.map((c) =>
+      li(
+        `${c.ok ? "✓" : "✗"} ${c.label}`,
+        `${c.value}${c.ok ? "" : ` — ${c.hint}`}`,
+      )
+    ),
+    li(
+      "Listening ports",
+      sec.ports.length === 0
+        ? "none"
+        : sec.ports.map((p) =>
+          `${p.proto}/${p.port}${p.process ? ` ${p.process}` : ""}${
+            p.exposed ? " (exposed)" : ""
+          }`
+        ).join(", "),
+    ),
+    sec.procs.length > 0 &&
+    `- Suspicious processes:\n${
+      sec.procs.map((p) =>
+        `    · pid ${p.pid} ${p.user}: ${p.cmd} — ${p.reason}`
+      )
+        .join("\n")
+    }`,
+  ]);
+
 export const todoReport = (issues: Issue[]): string =>
   rpt(
     "Health / TODO",
@@ -481,6 +597,7 @@ export const fullReport = (s: ReportInput, issues: Issue[]): string => {
     gpuReport(s.gpu),
     diskReport(s.disk),
     netReport(s.net),
+    secReport(s.sec, s.net),
     lspciReport(s.lspci),
     lsusbReport(s.lsusb),
   ].filter(Boolean).join("\n\n");
@@ -507,6 +624,8 @@ const ICON_PATHS: Record<string, string> = {
     "M8 1.5v10 M8 4.5l3.5 1.5v1.5 M8 7.5L4.5 9v1.5 M9.5 13a1.5 1.5 0 1 0-3 0a1.5 1.5 0 1 0 3 0",
   todo:
     "M2.5 2.5h11v11h-11z M4.8 5.4l1.3 1.3 2.2-2.4 M4.8 9.4l1.3 1.3 2.2-2.4 M10 5.5h2.5 M10 9.5h2.5",
+  sec:
+    "M8 1.5l5.5 2v4c0 3.5-2.3 6-5.5 7-3.2-1-5.5-3.5-5.5-7v-4z M5.8 8l1.6 1.6 3-3.2",
 };
 
 const Icon = ({ name }: { name: string }) => (
@@ -1230,6 +1349,152 @@ const DiskPanel = ({ info }: { info: DiskInfo | null }) => (
   </Panel>
 );
 
+// Group listening sockets for display — one pill per (process, exposure)
+// instead of one per port: a dev box can hold 70+ listeners (test validators,
+// game clients) and per-port pills flood the panel. Pure + exported for tests.
+export type PortGroup = {
+  label: string; // "sshd:22" (single) or "solana-test-val ×22" (many)
+  detail: string; // full port list for the tooltip
+  exposed: boolean;
+  count: number;
+};
+export const groupPorts = (ports: SecInfo["ports"]): PortGroup[] => {
+  const by = new Map<string, { ports: typeof ports; exposed: boolean }>();
+  for (const p of ports) {
+    const name = p.process || p.proto;
+    const key = `${name} ${p.exposed}`;
+    const g = by.get(key) ?? { ports: [], exposed: p.exposed };
+    g.ports.push(p);
+    by.set(key, g);
+  }
+  return [...by.entries()]
+    .map(([key, g]) => {
+      const name = key.split(" ")[0] ?? "";
+      return {
+        label: g.ports.length === 1
+          ? `${name}:${g.ports[0]?.port}`
+          : `${name} ×${g.ports.length}`,
+        detail: g.ports.map((p) => `${p.proto} ${p.addr}:${p.port}`).join("\n"),
+        exposed: g.exposed,
+        count: g.ports.length,
+      };
+    })
+    // exposed first, then biggest groups — the risky stuff reads first
+    .sort((a, b) => Number(b.exposed) - Number(a.exposed) || b.count - a.count);
+};
+
+// Security panel — posture score ring, hardening checklist, listening ports,
+// suspicious processes. Everything judged in the Rust parser; this renders.
+const SecPanel = (
+  { sec, net }: { sec: SecInfo | null; net: NetInfo | null },
+) => {
+  const score = secScore(sec, net);
+  const scoreColor = score >= 80 ? C.green : score >= 55 ? C.warn : C.bad;
+  const exposed = sec ? sec.ports.filter((p) => p.exposed) : [];
+  const passed = sec ? sec.checks.filter((c) => c.ok).length : 0;
+  return (
+    <Panel
+      title="SECURITY"
+      accent={C.pink}
+      icon="sec"
+      emoji="🛡"
+      copy={secReport(sec, net)}
+      right={sec
+        ? (
+          <Badge
+            text={sec.procs.length > 0 ? "THREAT" : `${score}`}
+            color={sec.procs.length > 0 ? C.bad : scoreColor}
+            dot={sec.procs.length > 0}
+          />
+        )
+        : undefined}
+    >
+      {sec
+        ? (
+          <>
+            <div class="sec-top">
+              <Ring value={score} color={scoreColor} label="score" size={62} />
+              <div class="sec-stats">
+                <Metric
+                  label="checks"
+                  emoji="🧱"
+                  value={`${passed}/${sec.checks.length}`}
+                  color={passed === sec.checks.length ? C.green : C.warn}
+                />
+                <Metric
+                  label="exposed"
+                  emoji="🚪"
+                  value={String(exposed.length)}
+                  sub={`${sec.ports.length} listening`}
+                  color={exposed.length === 0 ? C.green : C.warn}
+                />
+                <Metric
+                  label="threats"
+                  emoji="☠"
+                  value={String(sec.procs.length)}
+                  color={sec.procs.length === 0 ? C.green : C.bad}
+                />
+              </div>
+            </div>
+            {sec.procs.length > 0 && (
+              <div class="sec-threats">
+                {sec.procs.map((p, i) => (
+                  <div class="sec-threat" key={i} title={p.cmd}>
+                    <span class="sec-mark" style={{ color: C.bad }}>☠</span>
+                    <span class="sec-check-label">
+                      {p.pid} {p.user} · {p.reason}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+            {sec.checks.length > 0 && (
+              <div class="sec-checks">
+                {sec.checks.map((c, i) => (
+                  <div class="sec-check" key={i} title={c.hint}>
+                    <span
+                      class="sec-mark"
+                      style={{ color: c.ok ? C.green : C.bad }}
+                    >
+                      {c.ok ? "✓" : "✗"}
+                    </span>
+                    <span class="sec-check-label">{c.label}</span>
+                    <span
+                      class="sec-check-val"
+                      style={{ color: c.ok ? C.dim : C.warn }}
+                    >
+                      {c.value}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+            {sec.ports.length > 0 && (
+              <div class="sec-ports" title="listening sockets (ss -tuln)">
+                {groupPorts(sec.ports).map((g, i) => (
+                  <span
+                    class="sec-port"
+                    key={i}
+                    style={{
+                      color: g.exposed ? C.warn : C.dim,
+                      borderColor: (g.exposed ? C.warn : C.dim) + "55",
+                    }}
+                    title={`${g.detail}\n${
+                      g.exposed ? "reachable from the network" : "loopback only"
+                    }`}
+                  >
+                    {g.exposed ? "🌐" : "🔒"} {g.label}
+                  </span>
+                ))}
+              </div>
+            )}
+          </>
+        )
+        : <div class="empty">no security data</div>}
+    </Panel>
+  );
+};
+
 const NetPanel = ({ info }: { info: NetInfo | null }) => (
   <Panel
     title="NETWORK"
@@ -1560,6 +1825,9 @@ export default function App() {
               value={`${sys.procs_running}/${sys.procs_total}`}
             />
           )}
+          {sys.governor && (
+            <Chip emoji="⚙" label="governor" value={sys.governor} />
+          )}
         </div>
       )}
 
@@ -1574,6 +1842,7 @@ export default function App() {
         />
         <GpuPanel info={s.gpu} />
         <DiskPanel info={s.disk} />
+        <SecPanel sec={s.sec} net={s.net} />
         <NetPanel info={s.net} />
         <ListPanel
           title="LSPCI"
