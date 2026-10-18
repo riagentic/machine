@@ -164,15 +164,20 @@ async function call<T>(
   if (!e) return null;
   // allocate all inputs first (alloc may grow memory, invalidating earlier views)
   const args = inputs.map((s) => writeInput(e, s));
-  const fnRef = e[fn] as (...args: number[]) => number;
-  const outPtr = fnRef(...args.flatMap((a) => [a.ptr, a.len]));
-  const out = readOutput(e, outPtr);
-  // free inputs
-  args.forEach((a) => e.dealloc(a.ptr, a.len));
   try {
-    return JSON.parse(out) as T;
-  } catch {
-    return null;
+    const fnRef = e[fn] as (...args: number[]) => number;
+    const outPtr = fnRef(...args.flatMap((a) => [a.ptr, a.len]));
+    const out = readOutput(e, outPtr);
+    try {
+      return JSON.parse(out) as T;
+    } catch (err) {
+      warnOnce(`${fn} JSON`, String(err));
+      return null;
+    }
+  } finally {
+    // free inputs even if the syscall or readOutput threw — a leak here would
+    // grow WASM memory on every poll until the module is reloaded.
+    args.forEach((a) => e.dealloc(a.ptr, a.len));
   }
 }
 
@@ -192,35 +197,91 @@ const PLATFORM: "linux" | "windows" | "darwin" = Deno.build.os === "windows"
 
 export { PLATFORM };
 
+// Fail loud without spamming the 2s poll: each (site, message) warns once.
+const warned = new Set<string>();
+function warnOnce(site: string, msg: string): void {
+  const k = `${site}\0${msg}`;
+  if (warned.has(k)) return;
+  warned.add(k);
+  console.warn(`[machine] ${site}: ${msg}`);
+}
+
+// Optional probes (no hwmon temp, no sshd) legitimately don't exist — only a
+// non-ENOENT failure (permission, EIO) is worth a warning.
+function ioErr(site: string, e: unknown): void {
+  if (!(e instanceof Deno.errors.NotFound)) warnOnce(site, String(e));
+}
+
+// Module-level memo (server-only): reuse fn's promise for ttlMs. Caching the
+// promise also coalesces concurrent callers into one spawn.
+function memo<T>(ttlMs: number, fn: () => Promise<T>): () => Promise<T> {
+  let at = 0;
+  let p: Promise<T> | null = null;
+  return () => {
+    if (!p || Date.now() - at >= ttlMs) {
+      at = Date.now();
+      p = fn();
+    }
+    return p;
+  };
+}
+
 async function readFile(path: string): Promise<string> {
   try {
     return await Deno.readTextFile(path);
-  } catch {
+  } catch (e) {
+    ioErr(path, e);
     return "";
   }
 }
 
-async function runCmd(
+export async function runCmd(
   cmd: readonly string[],
-  opts?: { env?: Record<string, string> },
+  opts?: { env?: Record<string, string>; timeoutMs?: number },
 ): Promise<string> {
   const bin = cmd[0];
   if (!bin) return "";
+  // A hung command (stale-NFS df, SIGTERM-ignoring child, grandchild holding
+  // stdout) must not wedge the refresh loop forever — `refreshing` would stay
+  // true and every later poll would be skipped. Race the output against a
+  // timer; on timeout SIGKILL the child and return "" so the next poll retries.
+  const timeoutMs = opts?.timeoutMs ?? 4000;
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    const p = new Deno.Command(bin, {
+    const child = new Deno.Command(bin, {
       args: cmd.slice(1),
       stdout: "piped",
       stderr: "null",
       env: opts?.env,
-    });
-    const out = await p.output();
-    return new TextDecoder().decode(out.stdout).trim();
-  } catch {
+    }).spawn();
+    const out = await Promise.race([
+      child.output(),
+      new Promise<null>((r) => timer = setTimeout(() => r(null), timeoutMs)),
+    ]);
+    if (!out) {
+      try {
+        child.kill("SIGKILL");
+      } catch { /* exited between timeout and kill */ }
+      warnOnce(bin, `timed out after ${timeoutMs}ms`);
+      return "";
+    }
+    const text = dec.decode(out.stdout).trim();
+    if (!out.success && !text) warnOnce(cmd.join(" "), `exit ${out.code}`);
+    return text;
+  } catch (e) {
+    warnOnce(
+      bin,
+      e instanceof Deno.errors.NotFound ? "not installed" : String(e),
+    );
     return "";
+  } finally {
+    clearTimeout(timer);
   }
 }
 
-// gather hwmon into a textual block: "name\ntempN_input\n..." per device
+// gather hwmon into a textual block: "name\ntempN_input\n..." per device,
+// separated by a blank line so WASM parsers can delimit one device from the
+// next (sys_board reads temps until the blank line).
 async function readHwmonBlock(
   filter: (name: string) => boolean,
 ): Promise<string> {
@@ -234,14 +295,20 @@ async function readHwmonBlock(
       const name = (await readFile(`${dir}/name`)).trim();
       if (!filter(name)) continue;
       out += name + "\n";
-      for (let i = 1; i <= 8; i++) {
-        const v = (await readFile(`${dir}/temp${i}_input`)).trim();
-        if (!v) break;
-        out += v + "\n";
+      // every tempN_input, numerically ordered (temp1 first, gaps allowed)
+      const temps: number[] = [];
+      for await (const f of Deno.readDir(dir)) {
+        const m = f.name.match(/^temp(\d+)_input$/);
+        if (m) temps.push(Number(m[1]));
       }
+      for (const i of temps.sort((a, b) => a - b)) {
+        const v = (await readFile(`${dir}/temp${i}_input`)).trim();
+        if (v) out += v + "\n";
+      }
+      out += "\n"; // blank-line device separator
     }
-  } catch {
-    // /sys/class/hwmon not readable
+  } catch (e) {
+    ioErr("/sys/class/hwmon", e);
   }
   return out;
 }
@@ -255,7 +322,7 @@ async function readHwmonBlock(
 
 export async function cpu(): Promise<CpuInfo | null> {
   if (PLATFORM !== "linux") return cpuNonLinux();
-  const cpuinfo = await readFile("/proc/cpuinfo");
+  const cpuinfo = await cpuinfoOnce();
   // Full /proc/stat — the Rust parser extracts the aggregate line + per-core
   // cpuN lines so the cell can compute both aggregate + per-core utilization.
   const stat = await readFile("/proc/stat");
@@ -269,62 +336,62 @@ export async function cpu(): Promise<CpuInfo | null> {
 // Windows/OSX: synthesize a cpuinfo-like text + a stat line the Rust parser
 // can read. util_pct is derived from a single sample on these platforms
 // (PowerShell Get-Counter / top -l 1) and stamped onto the parsed CpuInfo.
+// Linux /proc/cpuinfo model+cores are static; per-sample reads skip it.
+const cpuinfoOnce = memo(Infinity, () => readFile("/proc/cpuinfo"));
+
+// Win/OSX: synthesize cpuinfo once — one "processor" line per logical core so
+// the Rust parser (which counts "processor" occurrences) reports the right
+// number.
+const cpuinfoNonLinux = memo(Infinity, async () => {
+  const [name = "", cores = ""] = PLATFORM === "windows"
+    ? (await runCmd([
+      "powershell",
+      "-NoProfile",
+      "-Command",
+      "$p=Get-CimInstance Win32_Processor; $p[0].Name; ($p | Measure-Object NumberOfLogicalProcessors -Sum).Sum",
+    ])).split("\n").map((l) => l.trim())
+    : await Promise.all([
+      runCmd(["sysctl", "-n", "machdep.cpu.brand_string"]),
+      runCmd(["sysctl", "-n", "hw.logicalcpu"]),
+    ]);
+  const procLines = Array.from(
+    { length: Math.max(1, parseInt(cores) || 1) },
+    (_, i) => `processor       : ${i}`,
+  ).join("\n");
+  return `model name      : ${name}\n${procLines}\n`;
+});
+
 async function cpuNonLinux(): Promise<CpuInfo | null> {
+  const cpuinfo = await cpuinfoNonLinux();
   if (PLATFORM === "windows") {
-    const name = await runCmd([
+    // One spawn per sample: util line, then ACPI thermal zone in tenths of
+    // Kelvin (root/wmi, admin-only → empty line otherwise).
+    const [util = "", tenthsK = ""] = (await runCmd([
       "powershell",
       "-NoProfile",
       "-Command",
-      "(Get-CimInstance Win32_Processor).Name",
+      "(Get-Counter '\\Processor(_Total)\\% Processor Time').CounterSamples.CookedValue; (Get-CimInstance -Namespace root/wmi MSAcpi_ThermalZoneTemperature -ErrorAction SilentlyContinue | Select-Object -First 1).CurrentTemperature",
+    ])).split("\n").map((l) => l.trim());
+    const k = parseFloat(tenthsK);
+    // hwmon-style block the parser matches: "core" name + millidegrees C
+    const hwmon = k > 0 ? `core\n${Math.round(k * 100 - 273150)}\n` : "";
+    const r = await call<CpuInfo>("sys_cpu", [
+      cpuinfo,
+      `cpu ${util || "0"}`,
+      hwmon,
     ]);
-    const coresStr = await runCmd([
-      "powershell",
-      "-NoProfile",
-      "-Command",
-      "(Get-CimInstance Win32_Processor).NumberOfLogicalProcessors",
-    ]);
-    const temp = await runCmd([
-      "powershell",
-      "-NoProfile",
-      "-Command",
-      "Get-CimInstance Win32_TemperatureProbe | Select-Object -ExpandProperty CurrentReading",
-    ]);
-    const util = await runCmd([
-      "powershell",
-      "-NoProfile",
-      "-Command",
-      "(Get-Counter '\\Processor(_Total)\\% Processor Time').CounterSamples.CookedValue",
-    ]);
-    // synthesize cpuinfo: one "processor" line per logical core so the Rust
-    // parser (which counts "processor" occurrences) reports the right number.
-    const nCores = Math.max(1, parseInt(coresStr) || 1);
-    const procLines = Array.from(
-      { length: nCores },
-      (_, i) => `processor       : ${i}`,
-    ).join("\n");
-    const cpuinfo = `model name      : ${name}\n${procLines}\n`;
-    const stat = `cpu ${util || "0"}`;
-    const r = await call<CpuInfo>("sys_cpu", [cpuinfo, stat, temp || ""]);
     if (r) r.util_pct = Math.max(0, Math.min(100, parseFloat(util) || 0));
     return r;
   }
-  // darwin
-  const name = await runCmd(["sysctl", "-n", "machdep.cpu.brand_string"]);
-  const coresStr = await runCmd(["sysctl", "-n", "hw.logicalcpu"]);
+  // darwin — top's first sample is since-boot, not an interval: take the 2nd
   const util = await runCmd([
     "sh",
     "-c",
-    "top -l 1 -n 0 | grep 'CPU usage' | head -1",
+    "top -l 2 -s 1 -n 0 | grep 'CPU usage' | tail -1",
   ]);
   // "CPU usage: 12.5% user, 5.2% sys, 82.3% idle" → extract idle → util = 100-idle
   const idleMatch = util.match(/([\d.]+)%\s*idle/);
   const utilPct = idleMatch ? (100 - parseFloat(idleMatch[1] ?? "0")) : 0;
-  const nCores = Math.max(1, parseInt(coresStr) || 1);
-  const procLines = Array.from(
-    { length: nCores },
-    (_, i) => `processor       : ${i}`,
-  ).join("\n");
-  const cpuinfo = `model name      : ${name}\n${procLines}\n`;
   const stat = `cpu ${utilPct}`;
   const r = await call<CpuInfo>("sys_cpu", [cpuinfo, stat, ""]);
   if (r) r.util_pct = Math.max(0, Math.min(100, utilPct));
@@ -358,7 +425,9 @@ async function memTempC(): Promise<number> {
 // degrades to empty list + 0 slots if dmidecode isn't available or permission
 // denied. slots_total counts every "Memory Device" block (occupied or not) so
 // the UI can show occupied/total.
-export async function dimms(): Promise<
+// dmidecode is static hardware — run once per process.
+export const dimms = memo(Infinity, dimmsUncached);
+async function dimmsUncached(): Promise<
   { list: DimmInfo[]; slots_total: number }
 > {
   if (PLATFORM !== "linux") return { list: [], slots_total: 0 }; // Win/OSX TODO
@@ -401,10 +470,13 @@ async function memNonLinux(): Promise<MemInfo | null> {
   const vmstat = await runCmd(["vm_stat"]);
   const pageSizeMatch = vmstat.match(/page size of (\d+) bytes/);
   const pageSize = parseInt(pageSizeMatch?.[1] ?? "4096");
-  const freePagesMatch = vmstat.match(/Pages free:\s+(\d+)/);
-  const freeKb = freePagesMatch
-    ? Math.floor((parseInt(freePagesMatch[1] ?? "0") || 0 * pageSize) / 1024)
-    : 0;
+  // reclaimable = free + inactive + speculative + purgeable pages
+  const freePages = [
+    ...vmstat.matchAll(
+      /Pages (?:free|inactive|speculative|purgeable):\s+(\d+)/g,
+    ),
+  ].reduce((a, m) => a + (parseInt(m[1] ?? "0") || 0), 0);
+  const freeKb = Math.floor((freePages * pageSize) / 1024);
   const totalKb = Math.floor((parseInt(totalBytes) || 0) / 1024);
   const info = `MemTotal:       ${totalKb} kB\nMemAvailable:   ${freeKb} kB\n`;
   const r = await call<MemInfo>("sys_mem", [info]);
@@ -414,26 +486,31 @@ async function memNonLinux(): Promise<MemInfo | null> {
 
 export async function board(): Promise<BoardInfo | null> {
   if (PLATFORM !== "linux") return boardNonLinux();
-  const read = async (p: string) => (await readFile(p)).trim();
+  // super-I/O chips first (parser prefers them); nvme is a disk, not the board
   const hw = await readHwmonBlock((n) =>
-    n.startsWith("nct") || n.includes("acpi") || n === "nvme" ||
-    n.includes("board")
+    n.startsWith("nct") || n.startsWith("it87") || n.startsWith("asus") ||
+    n.includes("acpi") || n.includes("board")
   );
-  const r = await call<BoardInfo>("sys_board", [
-    await read("/sys/class/dmi/id/board_name"),
-    await read("/sys/class/dmi/id/board_vendor"),
-    await read("/sys/class/dmi/id/board_version"),
-    await read("/sys/class/dmi/id/bios_vendor"),
-    await read("/sys/class/dmi/id/bios_version"),
-    await read("/sys/class/dmi/id/bios_date"),
-    await read("/sys/class/dmi/id/product_name"),
-    hw,
-  ]);
+  const r = await call<BoardInfo>("sys_board", [...await dmiOnce(), hw]);
   // usb_ports is host-stamped (the Rust parser has no USB input): sum of
   // maxchild over root hubs = physical ports on the machine.
   if (r) r.usb_ports = await usbPortCount();
   return r;
 }
+
+// DMI strings are static — read once per process.
+const dmiOnce = memo(Infinity, () =>
+  Promise.all(
+    [
+      "board_name",
+      "board_vendor",
+      "board_version",
+      "bios_vendor",
+      "bios_version",
+      "bios_date",
+      "product_name",
+    ].map(async (f) => (await readFile(`/sys/class/dmi/id/${f}`)).trim()),
+  ));
 
 async function usbPortCount(): Promise<number> {
   let n = 0;
@@ -445,13 +522,15 @@ async function usbPortCount(): Promise<number> {
       );
       if (v > 0) n += v;
     }
-  } catch {
-    // /sys/bus/usb not readable
+  } catch (e) {
+    ioErr("/sys/bus/usb/devices", e);
   }
   return n;
 }
 
-async function boardNonLinux(): Promise<BoardInfo | null> {
+// Win/OSX board data has no live temps — static, fetch once.
+const boardNonLinux = memo(Infinity, boardNonLinuxUncached);
+async function boardNonLinuxUncached(): Promise<BoardInfo | null> {
   if (PLATFORM === "windows") {
     const get = async (cls: string, prop: string) =>
       (await runCmd([
@@ -490,13 +569,36 @@ async function boardNonLinux(): Promise<BoardInfo | null> {
   return r;
 }
 
+// Linux: true when an NVIDIA GPU is bound and awake. nvidia-smi wakes a
+// runtime-suspended dGPU (hybrid laptops), so skip it while all sleep.
+async function nvidiaAwake(): Promise<boolean> {
+  const ids: string[] = [];
+  try {
+    for await (const e of Deno.readDir("/proc/driver/nvidia/gpus")) {
+      ids.push(e.name);
+    }
+  } catch (e) {
+    ioErr("/proc/driver/nvidia/gpus", e);
+  }
+  for (const id of ids) {
+    const st = await readFile(
+      `/sys/bus/pci/devices/${id}/power/runtime_status`,
+    );
+    if (st.trim() !== "suspended") return true;
+  }
+  return false;
+}
+
 export async function gpu(): Promise<GpuInfo | null> {
-  // nvidia-smi works cross-platform (Linux/Win/OSX) when present
-  const nvidia = await runCmd([
-    "nvidia-smi",
-    "--query-gpu=name,temperature.gpu,utilization.gpu,memory.total,memory.used",
-    "--format=csv,noheader,nounits",
-  ]);
+  // nvidia-smi works on Linux/Windows when present (no NVIDIA on modern OSX)
+  const nvidia = PLATFORM === "darwin" ||
+      (PLATFORM === "linux" && !await nvidiaAwake())
+    ? ""
+    : await runCmd([
+      "nvidia-smi",
+      "--query-gpu=name,temperature.gpu,utilization.gpu,memory.total,memory.used",
+      "--format=csv,noheader,nounits",
+    ]);
   let hw = "";
   if (PLATFORM === "linux") {
     try {
@@ -515,12 +617,12 @@ export async function gpu(): Promise<GpuInfo | null> {
             const tempV = (await readFile(`${p}/temp1_input`)).trim();
             hw += `${name}\n${tempV}\n${busy || "0"}\n0\n`;
           }
-        } catch {
-          // no hwmon
+        } catch (e) {
+          ioErr(hwmonDir, e); // connectors (cardN-DP-1) have no hwmon: ENOENT
         }
       }
-    } catch {
-      // /sys/class/drm not readable
+    } catch (e) {
+      ioErr("/sys/class/drm", e);
     }
   } else if (PLATFORM === "windows") {
     // Windows: nvidia-smi covers NVIDIA; AMD/Intel via wmic
@@ -549,7 +651,8 @@ export async function gpu(): Promise<GpuInfo | null> {
 
 export async function disk(): Promise<DiskInfo | null> {
   if (PLATFORM === "linux") {
-    const df = await runCmd(["df", "-P", "-B1"]);
+    // -l: local filesystems only — a stale NFS mount would hang df
+    const df = await runCmd(["df", "-l", "-P", "-B1"]);
     return call<DiskInfo>("sys_disk", [df]);
   }
   if (PLATFORM === "windows") {
@@ -558,54 +661,78 @@ export async function disk(): Promise<DiskInfo | null> {
       "powershell",
       "-NoProfile",
       "-Command",
-      "Get-Volume | Where-Object DriveLetter | ForEach-Object { $_.DriveLetter + ' ' + $_.Size + ' ' + ($_.Size - $_.SizeRemaining) + ' ' + [math]::Round((($_.Size - $_.SizeRemaining)/$_.Size)*100,1) + '%' + ' ' + $_.DriveLetter + ':' }",
+      "Get-Volume | Where-Object { $_.DriveLetter -and $_.Size } | ForEach-Object { '{0} {1} {2}' -f $_.DriveLetter,$_.Size,$_.SizeRemaining }",
     ]);
     // reformat into df -P columns: Filesystem 1B-blocks Used Available Capacity% MountedOn
+    // (the parser treats mount "C:" as root)
     const lines = out.split("\n").filter(Boolean).map((l) => {
-      const [letter, size, used, pct] = l.trim().split(/\s+/);
-      return `${letter}: ${size} ${used} 0 ${pct} ${letter}:`;
+      const [letter, sizeS, freeS] = l.trim().split(/\s+/);
+      const size = Number(sizeS) || 0;
+      const free = Number(freeS) || 0;
+      const pct = size ? ((size - free) / size * 100).toFixed(1) : "0";
+      return `${letter}: ${size} ${size - free} ${free} ${pct}% ${letter}:`;
     }).join("\n");
     return call<DiskInfo>("sys_disk", [lines]);
   }
   // darwin — df -g works but in GB blocks; use -k for kB
-  const df = await runCmd(["df", "-P", "-k"]);
-  // convert kB df to B for consistent units: multiply size/used by 1024
+  const df = await runCmd(["df", "-l", "-P", "-k"]);
+  // convert kB df to B for consistent units: multiply size/used/avail by 1024
   const lines = df.split("\n").map((l) => {
     const cols = l.split(/\s+/);
     if (cols.length < 6 || cols[1] === "1024-blocks") return l;
-    const totalB = (parseInt(cols[1] ?? "0") || 0) * 1024;
-    const usedB = (parseInt(cols[2] ?? "0") || 0) * 1024;
-    return `${cols[0]} ${totalB} ${usedB} 0 ${cols[4] ?? "0%"} ${
-      cols[5] ?? "/"
+    const [totalB, usedB, availB] = [1, 2, 3].map((i) =>
+      (parseInt(cols[i] ?? "0") || 0) * 1024
+    );
+    return `${cols[0]} ${totalB} ${usedB} ${availB} ${cols[4]} ${
+      cols.slice(5).join(" ")
     }`;
   }).join("\n");
   return call<DiskInfo>("sys_disk", [lines]);
 }
 
-export async function lspci(): Promise<LspciEntry[] | null> {
+// `lspci -nnmm`-style line the Rust parser reads: slot "class" "vendor" "name"
+const mmLine = (fields: string[]) =>
+  `- ${fields.map((f) => `"${f.trim().replaceAll('"', "'")}"`).join(" ")}`;
+
+// Device lists change only on hotplug — refresh at most every 30s.
+export const lspci = memo(30_000, lspciUncached);
+async function lspciUncached(): Promise<LspciEntry[] | null> {
   if (PLATFORM === "linux") {
     const raw = await runCmd(["lspci", "-nnmm"]);
     return call<LspciEntry[]>("sys_lspci", [raw]);
   }
   if (PLATFORM === "windows") {
-    // Windows: Get-CimInstance Win32_PnPEntity is the closest; parse names
+    // Win32_PnPEntity filtered to PCI devices, tab-separated class/vendor/name
     const out = await runCmd([
       "powershell",
       "-NoProfile",
       "-Command",
-      "Get-CimInstance Win32_PnPEntity | Select-Object -ExpandProperty Name",
+      "Get-CimInstance Win32_PnPEntity | Where-Object { $_.PNPDeviceID -like 'PCI\\*' } | ForEach-Object { \"$($_.PNPClass)`t$($_.Manufacturer)`t$($_.Name)\" }",
     ]);
-    // synthesize lspci -nnmm format: "Class Vendor Name"
-    const lines = out.split("\n").filter(Boolean).map((l) => `PCI ${l.trim()}`)
-      .join("\n");
+    const lines = out.split("\n").filter((l) => l.trim())
+      .map((l) => mmLine(l.split("\t"))).join("\n");
     return call<LspciEntry[]>("sys_lspci", [lines]);
   }
-  // darwin — system_profiler SPDisplaysDataType + SPThunderboltDataType
-  const out = await runCmd(["system_profiler", "SPPCIDataType"]);
-  return call<LspciEntry[]>("sys_lspci", [out]);
+  // darwin — system_profiler JSON (often empty on Apple Silicon → [])
+  const out = await runCmd(["system_profiler", "-json", "SPPCIDataType"]);
+  let devs: Record<string, string>[] = [];
+  try {
+    devs = out ? JSON.parse(out).SPPCIDataType ?? [] : [];
+  } catch (e) {
+    warnOnce("system_profiler SPPCIDataType", String(e));
+  }
+  const lines = devs.map((d) =>
+    mmLine([
+      d["sppci_device_type"] ?? "",
+      d["sppci_vendor-id"] ?? "",
+      d["_name"] ?? "",
+    ])
+  ).join("\n");
+  return call<LspciEntry[]>("sys_lspci", [lines]);
 }
 
-export async function lsusb(): Promise<LsusbEntry[] | null> {
+export const lsusb = memo(30_000, lsusbUncached);
+async function lsusbUncached(): Promise<LsusbEntry[] | null> {
   if (PLATFORM === "linux") {
     const raw = await runCmd(["lsusb"]);
     return call<LsusbEntry[]>("sys_lsusb", [raw]);
@@ -635,11 +762,13 @@ export async function lsusb(): Promise<LsusbEntry[] | null> {
 
 export async function net(): Promise<NetInfo | null> {
   if (PLATFORM === "linux") {
-    const addrs = await runCmd(["ip", "-j", "-br", "addr"]);
-    const links = await runCmd(["ip", "-j", "-br", "link"]);
-    const route = await runCmd(["ip", "route", "show", "default"]);
-    const fw = await detectFirewallState();
-    const speedInfo = await readNetSpeed();
+    const [addrs, links, route, fw] = await Promise.all([
+      runCmd(["ip", "-j", "-br", "addr"]),
+      runCmd(["ip", "-j", "-br", "link"]),
+      runCmd(["ip", "route", "show", "default"]),
+      detectFirewallState(),
+    ]);
+    const speedInfo = await readNetSpeed(route);
     return call<NetInfo>("sys_net", [addrs, links, route, fw, speedInfo]);
   }
   if (PLATFORM === "windows") {
@@ -656,30 +785,45 @@ export async function net(): Promise<NetInfo | null> {
       "-Command",
       "(Get-NetFirewallProfile | Where-Object Enabled).Count",
     ]);
-    const fw = parseInt(fwState) > 0 ? "ufw:active" : "none";
+    const fw = `defender:${parseInt(fwState) > 0 ? "active" : "inactive"}`;
     const vpn = addrs.includes("WAN") || addrs.includes("RAS");
-    const links = vpn ? '[{"ifname":"tun0"}]' : "[]";
+    const links = vpn ? '[{"ifname":"tun0","operstate":"UP"}]' : "[]";
     const speedInfo = readNetSpeedWindows();
     return call<NetInfo>("sys_net", [addrs, links, route, fw, speedInfo]);
   }
-  // darwin
-  const addrs = await runCmd(["ifconfig"]);
+  // darwin — ifconfig text → `ip -j -br addr`-shaped JSON array
+  const ifconfig = await runCmd(["ifconfig"]);
+  const ifaces = ifconfig.split(/\n(?=\S)/).filter(Boolean).map((b) => ({
+    ifname: b.split(":")[0] ?? "",
+    addr_info: [...b.matchAll(/\binet6?\s+(\S+)/g)].map((m) => ({
+      local: m[1],
+    })),
+  }));
   const route = await runCmd(["netstat", "-rn", "-f", "inet"]);
   const pf = await runCmd(["pfctl", "-s", "info"]);
-  const fw = pf.includes("Status: Enabled") ? "ufw:active" : "none";
-  const vpn = /utun|ppp|ipsec/.test(addrs);
-  const links = vpn ? '[{"ifname":"tun0"}]' : "[]";
+  const fw = `pf:${pf.includes("Status: Enabled") ? "active" : "inactive"}`;
+  // system utunN tunnels (iCloud etc.) carry only IPv6 — a VPN has IPv4
+  const vpn = ifaces.some((i) =>
+    /^(utun|ppp|ipsec)/.test(i.ifname) &&
+    i.addr_info.some((a) => a.local?.includes("."))
+  );
+  const links = vpn ? '[{"ifname":"tun0","operstate":"UP"}]' : "[]";
   const speedInfo = readNetSpeedDarwin();
-  return call<NetInfo>("sys_net", [addrs, links, route, fw, speedInfo]);
+  return call<NetInfo>("sys_net", [
+    JSON.stringify(ifaces),
+    links,
+    route,
+    fw,
+    speedInfo,
+  ]);
 }
 
 // Network speed: read link max (Mbps) from /sys/class/net/IFACE/speed and
 // rx/tx byte counters from /sys/class/net/IFACE/statistics. The cell computes
 // the rate (Mbps) from the byte delta between samples. We stash the raw byte
 // counts in rx_mbps/tx_mbps — the cell converts to rates.
-async function readNetSpeed(): Promise<string> {
-  // Find the default-route interface (the one actually in use)
-  const route = await runCmd(["ip", "route", "show", "default"]);
+async function readNetSpeed(route: string): Promise<string> {
+  // the default-route interface (the one actually in use)
   const ifaceMatch = route.match(/dev\s+(\S+)/);
   const iface = ifaceMatch?.[1] ?? "eth0";
   const speed = await readFile(`/sys/class/net/${iface}/speed`);
@@ -689,8 +833,16 @@ async function readNetSpeed(): Promise<string> {
   const rx = parseInt(rxBytes.trim()) || 0;
   const tx = parseInt(txBytes.trim()) || 0;
   // rx_mbps/tx_mbps carry RAW BYTE COUNTS here — the cell computes the rate
-  // from the delta. link_max_mbps is the link speed cap.
-  return JSON.stringify({ link_max_mbps: linkMax, rx_mbps: rx, tx_mbps: tx });
+  // from the delta. link_max_mbps is the link speed cap. iface is the
+  // interface those counters belong to, so the cell can drop the delta when
+  // the default route (and its counters) switches mid-sample.
+  return JSON.stringify({
+    link_max_mbps: linkMax,
+    rx_mbps: rx,
+    tx_mbps: tx,
+    iface,
+    ts: Date.now(),
+  });
 }
 
 function readNetSpeedWindows(): string {
@@ -778,14 +930,22 @@ export async function sys(): Promise<SysInfo> {
   return base;
 }
 
+// "<backend>:active|inactive" | "none", root-free. ufw.service stays
+// "active" even when ufw is disabled, so ufw also needs ENABLED=yes. A bare
+// nft ruleset (docker's NAT) is not a firewall — only the nftables service.
 async function detectFirewallState(): Promise<string> {
-  if (await runCmd(["nft", "list", "ruleset"])) return "nftables";
-  const ufw = await runCmd(["ufw", "status"]);
-  if (ufw) {
-    return ufw.includes("Status: active") ? "ufw:active" : "ufw:inactive";
-  }
-  if (await runCmd(["firewall-cmd", "--state"])) return "firewalld";
-  return "none";
+  const [ufw = "", firewalld = "", nftables = ""] = (await runCmd([
+    "systemctl",
+    "is-active",
+    "ufw",
+    "firewalld",
+    "nftables",
+  ])).split("\n");
+  const ufwConf = await readFile("/etc/ufw/ufw.conf");
+  if (ufw === "active" && /^ENABLED=yes/m.test(ufwConf)) return "ufw:active";
+  if (firewalld === "active") return "firewalld:active";
+  if (nftables === "active") return "nftables:active";
+  return ufwConf ? "ufw:inactive" : "none";
 }
 
 // ── sec: security posture inputs (ports, processes, hardening facts) ───────
@@ -805,10 +965,50 @@ const SYSCTL_CHECKS: readonly [string, string][] = [
   ["unprivileged_bpf_disabled", "/proc/sys/kernel/unprivileged_bpf_disabled"],
 ];
 
+const mokOnce = memo(Infinity, () => runCmd(["mokutil", "--sb-state"]));
+
+// sshd_config with `Include` lines replaced by the matching files (sorted,
+// relative to /etc/ssh, `*`/`?` globs in the basename) — sshd semantics.
+// Exported (with runCmd) for test/io.test.ts.
+export async function sshdConfig(path: string, depth = 0): Promise<string> {
+  const text = await readFile(path);
+  if (depth > 8) return text; // sshd's own nesting cap is similar
+  const out: string[] = [];
+  for (const line of text.split("\n")) {
+    const m = line.match(/^\s*Include\s+(.+)$/i);
+    if (!m) {
+      out.push(line);
+      continue;
+    }
+    for (const pat of (m[1] ?? "").trim().split(/\s+/)) {
+      const full = pat.startsWith("/") ? pat : `/etc/ssh/${pat}`;
+      const i = full.lastIndexOf("/");
+      const dir = full.slice(0, i);
+      const re = new RegExp(
+        "^" + full.slice(i + 1).replace(/[.+^${}()|[\]\\]/g, "\\$&")
+          .replaceAll("*", ".*").replaceAll("?", ".") +
+          "$",
+      );
+      const names: string[] = [];
+      try {
+        for await (const e of Deno.readDir(dir)) {
+          if (re.test(e.name)) names.push(e.name);
+        }
+      } catch (e) {
+        ioErr(dir, e);
+      }
+      for (const n of names.sort()) {
+        out.push(await sshdConfig(`${dir}/${n}`, depth + 1));
+      }
+    }
+  }
+  return out.join("\n");
+}
+
 async function secFactsLinux(): Promise<string> {
   const facts: string[] = [];
   // Secure Boot — mokutil is the portable answer; efivars fallback needs root.
-  const mok = await runCmd(["mokutil", "--sb-state"]);
+  const mok = await mokOnce();
   facts.push(
     `secureboot ${
       mok.includes("enabled")
@@ -829,12 +1029,15 @@ async function secFactsLinux(): Promise<string> {
   return facts.join("\n");
 }
 
-export async function sec(): Promise<SecInfo | null> {
+// ss -p/ps -e/lsblk are the costliest spawns — the posture bundle refreshes
+// at most every 30s.
+export const sec = memo(30_000, secUncached);
+async function secUncached(): Promise<SecInfo | null> {
   if (PLATFORM === "linux") {
     const [ss, ps, sshd, facts, ...sysctlVals] = await Promise.all([
       runCmd(["ss", "-tulnpH"]),
       runCmd(["ps", "-eo", "pid=,user=,args="]),
-      readFile("/etc/ssh/sshd_config"),
+      sshdConfig("/etc/ssh/sshd_config"),
       secFactsLinux(),
       ...SYSCTL_CHECKS.map(([, path]) => readFile(path)),
     ]);
@@ -901,25 +1104,25 @@ export async function sec(): Promise<SecInfo | null> {
 
 import type { MachineState } from "./wasm.ts";
 
-export type HardwareSnapshot = Pick<
-  MachineState,
-  | "cpu"
-  | "mem"
-  | "dimms"
-  | "memSlotsTotal"
-  | "board"
-  | "gpu"
-  | "disk"
-  | "lspci"
-  | "lsusb"
-  | "net"
-  | "sys"
-  | "sec"
->;
+export type HardwareSnapshot =
+  & Pick<
+    MachineState,
+    | "mem"
+    | "dimms"
+    | "memSlotsTotal"
+    | "board"
+    | "gpu"
+    | "disk"
+    | "lspci"
+    | "lsusb"
+    | "net"
+    | "sys"
+    | "sec"
+  >
+  & { wasmAvailable: boolean };
 
 export async function collectAll(): Promise<HardwareSnapshot> {
   const [
-    cpuV,
     memV,
     dimmsV,
     boardV,
@@ -932,7 +1135,6 @@ export async function collectAll(): Promise<HardwareSnapshot> {
     secV,
   ] = await Promise
     .all([
-      cpu(),
       mem(),
       dimms(),
       board(),
@@ -945,7 +1147,6 @@ export async function collectAll(): Promise<HardwareSnapshot> {
       sec(),
     ]);
   return {
-    cpu: cpuV,
     mem: memV,
     dimms: dimmsV.list,
     memSlotsTotal: dimmsV.slots_total,
@@ -957,5 +1158,10 @@ export async function collectAll(): Promise<HardwareSnapshot> {
     net: netV,
     sys: sysV,
     sec: secV,
+    // wasmAvailable reflects whether the WASM module actually loaded, NOT
+    // whether every panel has data. A panel legitimately returning null (no
+    // GPU, no dmidecode, non-Linux) must not flip the badge to "wasm off" or
+    // raise a false CRIT issue.
+    wasmAvailable: (await load()) !== null,
   };
 }

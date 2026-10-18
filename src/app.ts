@@ -12,9 +12,7 @@ import { machine } from "./wasm.ts";
 
 await aio.run({
   appId: "machine",
-  appVersion: "0.2.0",
   cells: [machine],
-  persist: false, // hardware state is live, not persisted
   // Hardware reads (lspci/lsusb/df/ip) are inherently I/O-bound (50-300ms).
   // They run async off the reduce loop; the default 5ms effect budget is
   // tuned for sync CPU-bound effects. Raise both the budget and the slow-
@@ -23,6 +21,11 @@ await aio.run({
   // the work is awaited in parallel, not blocking render.
   effectTimeoutMs: 5000,
   perfBudget: { reduce: 100, effect: 500 },
+  // Hardening opt-ins (am fix --harden): a stray AIO_CDP/AIO_PORT env var
+  // from another app must not open a DevTools/TCP port here; a wire frame
+  // with no argument list is refused instead of running with `undefined`s.
+  electron: { ignoreDebugEnv: true },
+  wire: { refuseShortCalls: true },
   ui: {
     title: "machine",
     width: 460,
@@ -37,5 +40,6 @@ await aio.run({
   onStart: () => {
     // kick the first refresh immediately so the UI isn't empty for 2s
     machine.refresh();
+    machine.refreshCpu();
   },
 });

@@ -23,8 +23,8 @@
 
 ## Stack — Deno + aio, NOT Node/npm
 
-- Framework is **aio** (`v1.0.0-alpha28`), vendored via `dep/aio` symlink →
-  sibling `../../aio`.
+- Framework is **aio** (`1.0.20-beta`), vendored via `dep/aio` symlink → sibling
+  aio checkout (`am pin path:<abs>` records it in `.aio/pin.local`).
 - Runtime: **Deno 2.9+**. All commands are `deno ...`, never `npm`/`node`.
 - App entrypoint pattern (from aio examples/sibling apps): `src/app.ts` imports
   cells, calls `await aio.run({ appId, cells, ui: {...} })`.
@@ -32,19 +32,17 @@
   `cell({ state, methods })` from `aio`.
 - Imports map `aio` → `./dep/aio/mod.ts` (and subpaths `aio/air`,
   `aio/jsx-runtime`, etc.) in `deno.json`.
-- Persistence is SQLite-only since alpha28 (`data.db`); no unstable flags.
-  Periphery symbols (`deepFreeze`, `parseCli`, …) live in `aio/extras`.
+- Persistence is SQLite-only; this app persists only `theme`. Periphery symbols
+  (`deepFreeze`, `parseCli`, …) live in `aio/extras`.
 
 ## Commands (aio app conventions — from sibling apps)
 
 - Dev server: `deno task dev` → `deno run -A src/app.ts`
-- Single-binary: `deno task compile` →
-  `deno run -A dep/aio/src/build.ts --compile`
-- Electron build: `deno run -A dep/aio/src/build.ts --compile --electron`
-- Android build: `deno run -A dep/aio/src/build.ts --android`
+- Desktop package: `deno task compile` (Electron target)
+- All targets (`build.targets` in deno.json): `deno task build`
 - Tests: `deno test -A <dir>`
 - App manager: `deno task am` → `deno run -A dep/aio/src/am.ts`
-  (start/stop/status/state/dispatch/tt/logs, `am surface 0 --json` for live UI
+  (start/stop/status/state/dispatch/tt/logs, `am surface --json` for live UI
   perception, `am trigger` to drive it)
 - Doctor (config sanity): `deno run -A dep/aio/src/server/doctor.ts`
 
@@ -67,8 +65,8 @@
   (`ui.XButton.click()`); await only observations (`expectCell`, `waitFor`,
   `settle`). Names are `LABEL+ROLE` from TSX (`<div class="button">Submit</div>`
   → `SubmitButton`). Use `await using ui = await testUI(App)`.
-- Live app: `am surface 0 --json` (full perception) +
-  `am trigger 0 "<path>" <action> [text]` — reply includes fresh post-action
+- Live app: `am surface --json` (full perception) +
+  `am trigger "<Comp:Name>" <action> [text]` — reply includes fresh post-action
   surface. Loop observe→act→observe, one call per step.
 
 ## Rust → WASM syscalls
@@ -102,4 +100,4 @@ order so "green locally" == "green in CI".
 - aio framework internals & full command list: `dep/aio/claude.md`,
   `dep/aio/README.md`, `dep/aio/docs/`.
 - Product requirements: `.katana/machine.md`.
-- Universal working rules: `/home/u/.katana/_universal.md`.
+- Universal working rules: `~/.katana/_universal.md`.

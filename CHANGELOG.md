@@ -4,6 +4,40 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims
 to adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.3] — 2026-10-18
+
+### Changed
+
+- **aio 1.0.20-beta** (from alpha28): `appVersion` removed from `aio.run()`
+  (deno.json `"version": "0.3"`, build number from git); `am pin path:` local
+  pin; deps pinned to aio's tested versions (Electron 44.7.0); tasks on the one
+  vocabulary (`build`, `compile`, `check`, `lint`, …); `scripts/wasm.ts`
+  replaces `rust/build.ts`; hardening opt-ins (`electron.ignoreDebugEnv`,
+  `wire.refuseShortCalls`).
+- Only theme + selected tab persist; server-only scratch is no longer broadcast.
+- I/O cost per poll cut: static sources cached, lspci/lsusb/security every 30s,
+  a sleeping NVIDIA dGPU is not woken, Windows CPU = 1 PowerShell/sample.
+- Left tab bar: one card at a time, or All (masonry, as many ≥200px columns as
+  fit). A single card fills the window at normal text size — its chart and lists
+  stretch, lists flow into columns.
+- Light theme meets WCAG AA; cores use lime (spec); CPU chart 100px; MOTHERBOARD
+  slot bar; PCI/USB rows get device icons.
+
+### Fixed
+
+- CPU % dipped to ~0 every 2s (double sample) — the 1s sampler owns CPU.
+- Commands that hang (stale NFS `df`) froze every panel — now SIGKILLed.
+- Firewall needed root to detect (ufw showed off); Windows/macOS named "ufw".
+- GPU panel vanished on `[N/A]` nvidia-smi fields; board temps were NVMe's;
+  hwmon sensors after a numbering gap were lost.
+- sshd: first value wins, `Match`/`Include` handled; AppImages, `rsync -l` no
+  longer flagged as threats; VPN ignores down/`tap` links.
+- Disk free excludes reserved blocks; mounts with spaces; Windows `C:` root.
+- Net rates shown without a link cap (Wi-Fi/VPN); rate uses read timestamps.
+- Manual refresh during a poll was dropped; paused header said "now".
+- Clipboard failures were silent; duplicate "Copy" labels; info rows showed ✓.
+- macOS net/mem/CPU parsing; WASM zero-size alloc UB; errors now warn once.
+
 ## [0.2.0] — 2026-07-24
 
 ### Added

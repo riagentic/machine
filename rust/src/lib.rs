@@ -192,19 +192,18 @@ pub extern "C" fn sys_board(
     let s = |p: *const u8, l: usize| read_str(p, l).to_string();
     let hwmon = read_str(hwmon, hw_len);
 
-    let mut temps: Vec<String> = Vec::new();
-    let mut lines = hwmon.lines();
-    while let Some(name) = lines.next() {
-        if name.starts_with("nct") || name.contains("acpi") || name == "nvme" || name.contains("board") {
-            while let Some(t) = lines.next() {
-                if t.is_empty() { break; }
-                if let Ok(v) = t.trim().parse::<f64>() {
-                    temps.push(format!("{:.1}", v / 1000.0));
-                }
-            }
-            break;
-        }
-    }
+    // Devices are blank-line separated "name\ntemp…" blocks. Super-I/O chips
+    // (nct*/it87*/asus*) are the real board sensors; acpi/board are fallbacks.
+    let rank = |n: &str| if n.starts_with("nct") || n.starts_with("it87") || n.starts_with("asus") { 0 }
+        else if n.contains("acpi") || n.contains("board") { 1 } else { 2 };
+    let best = hwmon.split("\n\n")
+        .filter_map(|b| { let mut l = b.lines().filter(|l| !l.is_empty()); l.next().map(|n| (rank(n), l)) })
+        .filter(|(r, _)| *r < 2)
+        .min_by_key(|(r, _)| *r);
+    // unconnected super-I/O inputs read 0 or a negative sentinel (-60) — drop
+    let temps: Vec<String> = best.map(|(_, l)| l.filter_map(|t| t.trim().parse::<f64>().ok())
+        .map(|v| v / 1000.0).filter(|c| *c > 0.0 && *c < 150.0)
+        .map(|c| format!("{:.1}", c)).collect()).unwrap_or_default();
 
     let m: Vec<(String, String, bool)> = vec![
         ("board_name".into(), s(board_name, bn_len), false),
@@ -233,9 +232,11 @@ pub extern "C" fn sys_gpu(nvidia_smi: *const u8, len: usize, hwmon: *const u8, h
         if line.is_empty() { continue; }
         let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
         if parts.len() >= 5 {
+            // "[N/A]"/"[Not Supported]" fields would be invalid JSON — default 0
+            let n = |i: usize| parts[i].parse::<f64>().unwrap_or(0.0);
             gpus.push(format!(
                 r#"{{"name":{},"temp_c":{},"util_pct":{},"mem_total_mb":{},"mem_used_mb":{}}}"#,
-                esc(parts[0]), parts[1], parts[2], parts[3], parts[4]
+                esc(parts[0]), n(1), n(2), n(3), n(4)
             ));
         }
     }
@@ -295,29 +296,33 @@ pub extern "C" fn sys_disk(df: *const u8, len: usize) -> *mut u8 {
     let mut root_total: u64 = 0;
     let mut root_used: u64 = 0;
     let mut root_pct: f64 = 0.0;
+    let mut root_avail: u64 = 0;
     for line in df.lines() {
         let cols: Vec<&str> = line.split_whitespace().collect();
         if cols.len() < 6 { continue; }
         // skip header
         if cols[0] == "Filesystem" { continue; }
-        let mp = cols[5];
+        let mp = &cols[5..].join(" "); // mount points may contain spaces
         let total: u64 = cols[1].parse().unwrap_or(0);
         let used: u64 = cols[2].parse().unwrap_or(0);
+        let avail: u64 = cols[3].parse().unwrap_or(0);
         let pct: f64 = cols[4].trim_end_matches('%').parse::<f64>().unwrap_or(0.0);
         if !is_reportable(cols[0], mp, total) { continue; }
         mounts.push(format!(
             r#"{{"mount":{},"total_b":{},"used_b":{},"used_pct":{:.1}}}"#,
             esc(mp), total, used, pct
         ));
-        if mp == "/" {
+        // Windows has no "/" — its system drive (C:) is the root
+        if mp == "/" || mp.eq_ignore_ascii_case("C:") {
             root_total = total;
             root_used = used;
             root_pct = pct;
+            root_avail = avail;
         }
     }
     return_str(format!(
-        r#"{{"root_total_b":{},"root_used_b":{},"root_used_pct":{:.1},"mounts":[{}]}}"#,
-        root_total, root_used, root_pct, join(&mounts)
+        r#"{{"root_total_b":{},"root_used_b":{},"root_used_pct":{:.1},"root_avail_b":{},"mounts":[{}]}}"#,
+        root_total, root_used, root_pct, root_avail, join(&mounts)
     ))
 }
 
@@ -437,7 +442,7 @@ pub extern "C" fn sys_lsusb(raw: *const u8, len: usize) -> *mut u8 {
 
 // ── Network / VPN / Firewall ──────────────────────────────────────────────
 // Inputs: `ip -j -br addr` (json), `ip -j -br link` (json), default route text,
-// firewall state string ("nftables"|"ufw:active"|"ufw:inactive"|"firewalld"|"none").
+// firewall state string ("<backend>:active"|"<backend>:inactive"|"none").
 
 #[no_mangle]
 pub extern "C" fn sys_net(
@@ -453,17 +458,18 @@ pub extern "C" fn sys_net(
     let fw_state = read_str(fw_state, fw_len);
     let speed_info = read_str(speed_info, si_len);
 
-    // VPN detection: tun/wg/ppp/tap/nordlynx/ipsec/openvpn interface names,
-    // OR POINTOPOINT flag in the link json (NordVPN's nordlynx shows this).
-    let vpn_patterns = ["\"tun", "\"wg", "\"ppp", "\"tap", "\"nordlynx", "\"ipsec", "\"openvpn"];
-    let vpn = vpn_patterns.iter().any(|p| links.contains(p))
-        || links.contains("\"POINTOPOINT\"");
-    let (fw_backend, fw_active) = match fw_state {
-        "nftables" => ("nftables", true),
-        "firewalld" => ("firewalld", true),
-        s if s.starts_with("ufw:active") => ("ufw", true),
-        s if s.starts_with("ufw:inactive") => ("ufw", false),
-        _ => ("none", false),
+    // VPN detection per link object (`ip -j -br link` has no nested objects):
+    // tun/wg/ppp/nordlynx/ipsec/openvpn names OR the POINTOPOINT flag (NordVPN's
+    // nordlynx), and only while operstate is UP/UNKNOWN (tunnels report
+    // UNKNOWN). No "tap" — QEMU/libvirt tap NICs are not VPNs.
+    let vpn_names = ["\"ifname\":\"tun", "\"ifname\":\"wg", "\"ifname\":\"ppp", "\"ifname\":\"nordlynx", "\"ifname\":\"ipsec", "\"ifname\":\"openvpn"];
+    let vpn = links.split('}').any(|o| {
+        (vpn_names.iter().any(|p| o.contains(p)) || o.contains("\"POINTOPOINT\""))
+            && (o.contains("\"operstate\":\"UP\"") || o.contains("\"operstate\":\"UNKNOWN\""))
+    });
+    let (fw_backend, fw_active) = match fw_state.split_once(':') {
+        Some((b, st)) => (b, st == "active"),
+        None => ("none", false),
     };
 
     // speed_info is a JSON object the host builds: {"link_max_mbps":N,"rx_mbps":N,"tx_mbps":N}
@@ -512,20 +518,19 @@ fn kv_lookup<'a>(block: &'a str, key: &str) -> Option<&'a str> {
     })
 }
 
-/// Effective value of an sshd_config directive — last non-comment wins.
+/// Effective global value of an sshd_config directive — sshd takes the FIRST
+/// value; `Match` starts conditional blocks, so stop there. The host inlines
+/// `Include`d files at their position before calling.
 fn sshd_directive<'a>(cfg: &'a str, key: &str) -> Option<&'a str> {
-    let mut val = None;
     for line in cfg.lines() {
-        let t = line.trim();
-        if t.starts_with('#') {
-            continue;
-        }
-        let mut it = t.split_whitespace();
-        if it.next().map(|k| k.eq_ignore_ascii_case(key)) == Some(true) {
-            val = it.next();
+        let mut it = line.trim().split_whitespace();
+        match it.next() {
+            Some(k) if k.eq_ignore_ascii_case("Match") => return None,
+            Some(k) if k.eq_ignore_ascii_case(key) => return it.next(),
+            _ => {}
         }
     }
-    val
+    None
 }
 
 #[no_mangle]
@@ -595,13 +600,15 @@ pub extern "C" fn sys_sec(
             continue;
         }
         let exe = args.split_whitespace().next().unwrap_or("");
-        let reason = if exe.starts_with("/tmp/") || exe.starts_with("/dev/shm/")
-            || exe.starts_with("/var/tmp/")
+        let base = exe.rsplit('/').next().unwrap_or("");
+        // /tmp/.mount_* = AppImage squashfuse mounts (incl. this app) — benign
+        let reason = if (exe.starts_with("/tmp/") && !exe.starts_with("/tmp/.mount_"))
+            || exe.starts_with("/dev/shm/") || exe.starts_with("/var/tmp/")
         {
             "executing from a world-writable dir"
-        } else if MINERS.iter().any(|m| exe.rsplit('/').next() == Some(*m)) {
+        } else if MINERS.contains(&base) {
             "known cryptominer name"
-        } else if (exe.ends_with("nc") || exe.ends_with("ncat") || exe.ends_with("socat"))
+        } else if ["nc", "ncat", "netcat", "socat"].contains(&base)
             && args.split_whitespace().any(|a| a == "-l" || a.starts_with("-l"))
         {
             "netcat listener"
@@ -705,6 +712,8 @@ fn json_obj(fields: &[(String, String, bool)]) -> String {
 // buffer, then frees with free_str.
 #[no_mangle]
 pub extern "C" fn alloc(len: usize) -> *mut u8 {
+    // zero-size Layout is UB for alloc — hand out a dangling, never-read ptr
+    if len == 0 { return std::ptr::NonNull::<u32>::dangling().as_ptr() as *mut u8; }
     unsafe {
         let layout = std::alloc::Layout::from_size_align_unchecked(len, 4);
         let ptr = std::alloc::alloc(layout);
@@ -717,7 +726,7 @@ pub extern "C" fn alloc(len: usize) -> *mut u8 {
 
 #[no_mangle]
 pub extern "C" fn dealloc(ptr: *mut u8, len: usize) {
-    if ptr.is_null() { return; }
+    if ptr.is_null() || len == 0 { return; }
     unsafe {
         let layout = std::alloc::Layout::from_size_align_unchecked(len, 4);
         std::alloc::dealloc(ptr, layout);
@@ -758,6 +767,97 @@ mod tests {
         assert!(s.contains(r#""total_kb":16384000"#), "got: {s}");
         assert!(s.contains(r#""used_kb":7384000"#), "got: {s}");
         free_str(out_ptr);
+    }
+
+    fn out(ptr: *mut u8) -> String {
+        let len = str_len(ptr);
+        let s = unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len)).to_string() };
+        free_str(ptr);
+        s
+    }
+
+    #[test]
+    fn parses_cpu_model_cores_and_temp() {
+        let cpuinfo = concat!(
+            "processor       : 0\n",
+            "vendor_id       : AuthenticAMD\n",
+            "model name      : AMD Ryzen 9 9950X\n",
+            "cpu MHz         : 4300.000\n",
+            "processor       : 1\n",
+            "vendor_id       : AuthenticAMD\n",
+            "model name      : AMD Ryzen 9 9950X\n",
+        );
+        let stat = concat!(
+            "cpu  123 45 678 9000 12 0 3 0 0 0\n",
+            "cpu0 60 20 300 4000 6 0 1 0 0 0\n",
+            "cpu1 63 25 378 5000 6 0 2 0 0 0\n",
+            "intr 0\n",
+        );
+        // coretemp device: name line then temp in millidegrees
+        let hwmon = concat!("coretemp\n", "45100\n", "46200\n", "45300\n", "\n", "k10temp\n", "52300\n");
+        let s = out(sys_cpu(
+            cpuinfo.as_ptr(), cpuinfo.len(),
+            stat.as_ptr(), stat.len(),
+            hwmon.as_ptr(), hwmon.len(),
+        ));
+        assert!(s.contains(r#""model":"AMD Ryzen 9 9950X""#), "got: {s}");
+        assert!(s.contains(r#""cores":2"#), "got: {s}");
+        assert!(s.contains(r#""temp_c":45.1"#), "coretemp 45100/1000 = 45.1; got: {s}");
+        // per-core stat lines returned raw for the host delta
+        assert!(s.contains(r#""cpu0 60"#), "got: {s}");
+        assert!(s.contains(r#""cpu1 63"#), "got: {s}");
+        // aggregate line is the first line of /proc/stat
+        assert!(s.contains(r#""stat":"cpu  123"#), "got: {s}");
+    }
+
+    #[test]
+    fn cpu_temp_skips_non_cpu_hwmon_devices() {
+        // an unrelated nvme/board device first must be skipped
+        let hwmon = concat!("nvme\n", "33000\n", "\n", "coretemp\n", "51000\n");
+        let s = out(sys_cpu(
+            std::ptr::null(), 0,
+            std::ptr::null(), 0,
+            hwmon.as_ptr(), hwmon.len(),
+        ));
+        assert!(s.contains(r#""temp_c":51.0"#), "nvme must be skipped, coretemp read; got: {s}");
+    }
+
+    #[test]
+    fn parses_gpu_nvidia_smi() {
+        let nvidia = concat!(
+            "NVIDIA GeForce RTX 4080, 61, 3, 16376, 4096\n",
+            "NVIDIA GeForce GT 1030, 40, 0, 2048, 512\n",
+        );
+        let s = out(sys_gpu(nvidia.as_ptr(), nvidia.len(), std::ptr::null(), 0));
+        assert!(s.contains(r#""name":"NVIDIA GeForce RTX 4080","temp_c":61,"util_pct":3,"mem_total_mb":16376,"mem_used_mb":4096"#), "got: {s}");
+        assert!(s.contains(r#""name":"NVIDIA GeForce GT 1030""#), "got: {s}");
+    }
+
+    #[test]
+    fn parses_gpu_hwmon_fallback() {
+        // amdgpu/i915 fallback: "name\ntemp\ntutil\0\nfreq\n" per device
+        let hwmon = concat!("amdgpu\n", "48000\n", "25\n", "0\n", "\n");
+        let s = out(sys_gpu(std::ptr::null(), 0, hwmon.as_ptr(), hwmon.len()));
+        assert!(s.contains(r#""name":"amdgpu","temp_c":48.0,"util_pct":25"#), "got: {s}");
+    }
+
+    #[test]
+    fn parses_board_and_temps() {
+        let hw = concat!("nct6798\n", "31000\n", "29000\n", "\n");
+        let s = out(sys_board(
+            "B650 AORUS".as_ptr(), "B650 AORUS".len(),
+            "Gigabyte".as_ptr(), "Gigabyte".len(),
+            "rev 1.0".as_ptr(), "rev 1.0".len(),
+            "American Megatrends".as_ptr(), "American Megatrends".len(),
+            "F21d".as_ptr(), "F21d".len(),
+            "04/11/2024".as_ptr(), "04/11/2024".len(),
+            "B650 AORUS".as_ptr(), "B650 AORUS".len(),
+            hw.as_ptr(), hw.len(),
+        ));
+        assert!(s.contains(r#""board_name":"B650 AORUS""#), "got: {s}");
+        assert!(s.contains(r#""board_vendor":"Gigabyte""#), "got: {s}");
+        assert!(s.contains(r#""bios_version":"F21d""#), "got: {s}");
+        assert!(s.contains(r#""temps_c":[31.0,29.0]"#), "got: {s}");
     }
 
     #[test]
@@ -836,13 +936,13 @@ mod tests {
     #[test]
     fn sec_checks_from_sysctl_sshd_and_facts() {
         let sysctl = "randomize_va_space 2\nptrace_scope 0\nkptr_restrict 1\nip_forward 1\n";
-        let sshd = "#PermitRootLogin prohibit-password\nPermitRootLogin yes\nPasswordAuthentication no\n";
+        let sshd = "#PermitRootLogin prohibit-password\nPermitRootLogin yes\nPasswordAuthentication no\nPermitRootLogin no\nMatch User bob\n  PasswordAuthentication yes\n";
         let facts = "secureboot disabled\nluks 1\nupdates 4\n";
         let s = sec_out("", "", sysctl, sshd, facts);
         assert!(s.contains(r#""id":"aslr","label":"ASLR","value":"full","ok":true"#), "got: {s}");
         assert!(s.contains(r#""id":"ptrace","label":"ptrace scope","value":"0","ok":false"#), "got: {s}");
         assert!(s.contains(r#""id":"ipfwd","label":"IP forwarding","value":"on","ok":false"#), "got: {s}");
-        // last non-comment directive wins → root login yes = fail; password no = ok
+        // first non-comment directive wins, Match blocks ignored → root yes = fail; password no = ok
         assert!(s.contains(r#""id":"ssh_root","label":"SSH root login","value":"yes","ok":false"#), "got: {s}");
         assert!(s.contains(r#""id":"ssh_pass","label":"SSH password auth","value":"no","ok":true"#), "got: {s}");
         assert!(s.contains(r#""id":"secboot","label":"Secure Boot","value":"disabled","ok":false"#), "got: {s}");
@@ -872,7 +972,7 @@ mod tests {
     #[test]
     fn detects_vpn() {
         // nordlynx interface (NordVPN) — must be detected
-        let links = r#"[{"ifname":"nordlynx","flags":["POINTOPOINT","UP"]},{"ifname":"enp8s0"}]"#;
+        let links = r#"[{"ifname":"nordlynx","operstate":"UNKNOWN","flags":["POINTOPOINT","UP"]},{"ifname":"enp8s0","operstate":"UP"}]"#;
         let out_ptr = sys_net(
             std::ptr::null(), 0,           // addr_json
             links.as_ptr(), links.len(),   // link_json
@@ -889,7 +989,7 @@ mod tests {
     #[test]
     fn detects_pointtopoint_vpn() {
         // POINTOPOINT flag without a known VPN interface name
-        let links = r#"[{"ifname":"wg0","flags":["POINTOPOINT","UP"]}]"#;
+        let links = r#"[{"ifname":"wg0","operstate":"UNKNOWN","flags":["POINTOPOINT","UP"]}]"#;
         let out_ptr = sys_net(
             std::ptr::null(), 0,
             links.as_ptr(), links.len(),
@@ -935,5 +1035,79 @@ mod tests {
         assert!(s.contains(r#""speed":"5600 MT/s""#), "got: {s}");
         assert!(!s.contains("No Module"), "empty slots should be excluded; got: {s}");
         free_str(out_ptr);
+    }
+    fn net_out(links: &str, fw: &str) -> String {
+        out(sys_net(std::ptr::null(), 0, links.as_ptr(), links.len(), std::ptr::null(), 0,
+            fw.as_ptr(), fw.len(), std::ptr::null(), 0))
+    }
+
+    #[test]
+    fn vpn_needs_operstate_up_and_ignores_tap() {
+        let down = r#"[{"ifname":"wg0","operstate":"DOWN","flags":["POINTOPOINT"]}]"#;
+        assert!(net_out(down, "none").contains(r#""vpn":false"#));
+        let tap = r#"[{"ifname":"tap0","operstate":"UP","flags":["BROADCAST","UP"]}]"#;
+        assert!(net_out(tap, "none").contains(r#""vpn":false"#));
+        let tun = r#"[{"ifname":"tun0","operstate":"UNKNOWN","flags":["UP"]}]"#;
+        assert!(net_out(tun, "none").contains(r#""vpn":true"#));
+    }
+
+    #[test]
+    fn firewall_backend_passes_through() {
+        assert!(net_out("", "defender:active").contains(r#""firewall":{"backend":"defender","active":true}"#));
+        assert!(net_out("", "ufw:inactive").contains(r#""firewall":{"backend":"ufw","active":false}"#));
+        assert!(net_out("", "none").contains(r#""firewall":{"backend":"none","active":false}"#));
+    }
+
+    #[test]
+    fn gpu_nvidia_na_fields_default_zero() {
+        let nv = "NVIDIA GeForce RTX 3050 Laptop GPU, [N/A], [Not Supported], 4096, 12\n";
+        let s = out(sys_gpu(nv.as_ptr(), nv.len(), std::ptr::null(), 0));
+        assert!(s.contains(r#""temp_c":0,"util_pct":0,"mem_total_mb":4096,"mem_used_mb":12"#), "got: {s}");
+    }
+
+    #[test]
+    fn board_temps_prefer_superio_over_nvme_acpi() {
+        let hw = concat!("acpitz\n", "27800\n", "\n", "nvme\n", "40000\n", "\n", "nct6799\n", "31000\n", "-60000\n", "0\n", "29000\n", "\n");
+        let e = "";
+        let s = out(sys_board(e.as_ptr(), 0, e.as_ptr(), 0, e.as_ptr(), 0, e.as_ptr(), 0,
+            e.as_ptr(), 0, e.as_ptr(), 0, e.as_ptr(), 0, hw.as_ptr(), hw.len()));
+        assert!(s.contains(r#""temps_c":[31.0,29.0]"#), "got: {s}");
+        let hw = concat!("nvme\n", "40000\n", "\n", "acpitz\n", "27800\n", "\n");
+        let s = out(sys_board(e.as_ptr(), 0, e.as_ptr(), 0, e.as_ptr(), 0, e.as_ptr(), 0,
+            e.as_ptr(), 0, e.as_ptr(), 0, e.as_ptr(), 0, hw.as_ptr(), hw.len()));
+        assert!(s.contains(r#""temps_c":[27.8]"#), "nvme never a board temp; got: {s}");
+    }
+
+    #[test]
+    fn disk_mount_with_spaces_avail_and_windows_root() {
+        let df = concat!(
+            "Filesystem 1B-blocks Used Available Capacity Mounted on\n",
+            "/dev/sdc1 1000 400 500 44% /run/media/u/My Disk\n",
+            "C: 2000 500 1500 25% C:\n",
+        );
+        let s = out(sys_disk(df.as_ptr(), df.len()));
+        assert!(s.contains(r#""mount":"/run/media/u/My Disk""#), "got: {s}");
+        assert!(s.contains(r#""root_total_b":2000,"root_used_b":500,"root_used_pct":25.0,"root_avail_b":1500"#), "got: {s}");
+    }
+
+    #[test]
+    fn sec_procs_no_false_positives() {
+        let ps = concat!(
+            " 10 dev /tmp/.mount_machinXyz/machine --no-sandbox\n",
+            " 11 dev rsync -lt a b\n",
+            " 12 dev x11vnc -localhost\n",
+            " 13 dev /usr/bin/nc -lvnp 4444\n",
+        );
+        let s = sec_out("", ps, "", "", "");
+        assert!(!s.contains("mount_"), "AppImage mount is benign; got: {s}");
+        assert!(!s.contains("rsync") && !s.contains("x11vnc"), "got: {s}");
+        assert!(s.contains(r#""pid":13"#), "got: {s}");
+    }
+
+    #[test]
+    fn zero_size_alloc_is_safe() {
+        let p = alloc(0);
+        assert!(!p.is_null());
+        dealloc(p, 0);
     }
 }

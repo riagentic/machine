@@ -69,3 +69,68 @@ testUI(App, "panels render all hardware sections", async (ui) => {
     );
   }
 });
+
+// Regression: the 2s full refresh and the 1s CPU sampler share the prev*
+// scratch state. Under transactional methods, concurrent runs used to abort on
+// TX_CONFLICT, leaving the whole deck empty. Both must commit cleanly now (the
+// shared accumulators are routed through s.$live, exempt from conflict checks).
+testUI(
+  App,
+  "concurrent refresh and refreshCpu both commit without conflict",
+  async (ui) => {
+    // Wait out the boot refresh so the baseline below is stable.
+    await ui.waitFor(() => !machine.refreshing, { timeoutMs: 8000 });
+    const before = machine.lastRefresh;
+    // Fire both without awaiting — overlapping, as the two schedules do live.
+    // Forced: a paused cell would otherwise skip the full refresh.
+    machine.refresh(true);
+    machine.refreshCpu();
+    // lastRefresh ADVANCING proves this refresh committed rather than being
+    // discarded (boot alone can't satisfy it).
+    await ui.waitFor(() => machine.lastRefresh > before, { timeoutMs: 8000 });
+    assertExists(
+      ui.App.RefreshButton,
+      "app still responsive after overlapping refresh + sampler",
+    );
+  },
+);
+
+// Both themes render every panel; contrast is audited by the harness on
+// render (any "[aio-dev] … unreadable" warning fails this test).
+testUI(App, "theme toggle renders both palettes cleanly", async (ui) => {
+  const warns: string[] = [];
+  const orig = console.warn;
+  console.warn = (...a: unknown[]) => {
+    warns.push(a.map(String).join(" "));
+    orig(...a);
+  };
+  try {
+    await ui.settle();
+    const start = machine.theme;
+    ui.App.ThemeButton.click();
+    await ui.waitFor(() => machine.theme !== start, { timeoutMs: 3000 });
+    await ui.settle();
+    assert(ui.html().includes(`data-theme="${machine.theme}"`));
+    ui.App.ThemeButton.click();
+    await ui.waitFor(() => machine.theme === start, { timeoutMs: 3000 });
+    await ui.settle();
+  } finally {
+    console.warn = orig;
+  }
+  const bad = warns.filter((w) => w.includes("unreadable"));
+  assert(bad.length === 0, `contrast warnings:\n${bad.join("\n")}`);
+});
+
+testUI(App, "left tabs show one card; All shows every card", async (ui) => {
+  await ui.settle();
+  ui.App.CPUTabButton.click();
+  await ui.waitFor(() => machine.view === "cpu", { timeoutMs: 3000 });
+  await ui.settle();
+  const one = ui.html();
+  assert(one.includes("CPU") && !one.includes("MOTHERBOARD"), "only CPU card");
+  ui.App.AllTabButton.click();
+  await ui.waitFor(() => machine.view === "all", { timeoutMs: 3000 });
+  await ui.settle();
+  const all = ui.html();
+  assert(all.includes("MOTHERBOARD") && all.includes("LSUSB"), "all cards");
+});

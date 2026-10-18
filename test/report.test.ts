@@ -8,16 +8,19 @@ import {
   cleanHw,
   computeHealth,
   cpuReport,
+  diskReport,
+  gpuReport,
   groupPorts,
   type HealthInput,
   lspciReport,
-  pciEmoji,
+  netReport,
+  pciIcon,
   type ReportInput,
   secReport,
   secScore,
   shortVendor,
   todoReport,
-  usbEmoji,
+  usbIcon,
 } from "../src/App.tsx";
 import type { NetInfo, SecInfo } from "../src/wasm.ts";
 
@@ -39,14 +42,23 @@ Deno.test("shortVendor extracts the [BRAND] tag, else first token", () => {
     shortVendor("Realtek Semiconductor Co., Ltd. [10ec]"),
     "Realtek",
   );
+  // A bare bracket pair is not a vendor — degrade to the em-dash, never "[]".
+  assertEquals(shortVendor("[]"), "—");
+  assertEquals(cleanHw("[]"), "");
 });
 
-Deno.test("pci/usb emoji classify common device kinds", () => {
-  assertEquals(pciEmoji("VGA compatible controller [0300]"), "🎮");
-  assertEquals(pciEmoji("Ethernet controller [0200]"), "🌐");
-  assertEquals(pciEmoji("Host bridge [0600]"), "🧩");
-  assertEquals(usbEmoji("Dell SK-3205 Keyboard"), "⌨️");
-  assertEquals(usbEmoji("Linux Foundation 2.0 root hub"), "🔀");
+Deno.test("cleanHw strips an empty bracket pair as noise", () => {
+  assertEquals(cleanHw(`"[]"`), "");
+  assertEquals(cleanHw(`"Device [14d8]"`), "Device");
+});
+
+Deno.test("pci/usb icons classify common device kinds", () => {
+  assertEquals(pciIcon("VGA compatible controller [0300]"), "gpu");
+  assertEquals(pciIcon("Ethernet controller [0200]"), "net");
+  assertEquals(pciIcon("Network controller: Wireless 802.11ax"), "wifi");
+  assertEquals(pciIcon("Host bridge [0600]"), "chip");
+  assertEquals(usbIcon("Dell SK-3205 Keyboard"), "keyboard");
+  assertEquals(usbIcon("Linux Foundation 2.0 root hub"), "usb");
 });
 
 // ── health / TODO detection ────────────────────────────────────────────────
@@ -73,6 +85,7 @@ Deno.test("computeHealth: full disk is a critical issue", () => {
       root_total_b: 100,
       root_used_b: 96,
       root_used_pct: 96,
+      root_avail_b: 4,
       mounts: [{ mount: "/home", total_b: 100, used_b: 96, used_pct: 96 }],
     },
   });
@@ -124,6 +137,7 @@ Deno.test("computeHealth ranks critical before warning", () => {
       root_total_b: 100,
       root_used_b: 95,
       root_used_pct: 95,
+      root_avail_b: 5,
       mounts: [{ mount: "/", total_b: 100, used_b: 95, used_pct: 95 }], // crit
     },
   });
@@ -325,6 +339,39 @@ Deno.test("cpuReport renders a markdown block with the key facts", () => {
   assertStringIncludes(out, "## CPU");
   assertStringIncludes(out, "AMD Ryzen 9 9950X");
   assertStringIncludes(out, "Threads: 32");
+});
+
+Deno.test("diskReport free is df Available, not total − used", () => {
+  const out = diskReport({
+    root_total_b: 100 * 2 ** 30,
+    root_used_b: 60 * 2 ** 30,
+    root_used_pct: 60,
+    root_avail_b: 35 * 2 ** 30, // 5 GiB root-reserved
+    mounts: [],
+  });
+  assertStringIncludes(out, "35.0 GiB free");
+});
+
+Deno.test("netReport shows rates without a link cap (Wi-Fi/VPN)", () => {
+  const out = netReport({
+    ...netUp,
+    speed: { link_max_mbps: -1, rx_mbps: 12.5, tx_mbps: 1, iface: "wlan0" },
+  });
+  assertStringIncludes(out, "Link: ↓12.5 ↑1.0 Mbps");
+});
+
+Deno.test("gpuReport labels VRAM in GiB; GPU at crit temp is CRIT", () => {
+  const gpu = {
+    gpus: [{
+      name: "RTX",
+      temp_c: 85,
+      util_pct: 10,
+      mem_total_mb: 8192,
+      mem_used_mb: 1024,
+    }],
+  };
+  assertStringIncludes(gpuReport(gpu), "1.0 / 8.0 GiB");
+  assert(computeHealth({ ...empty, gpu }).some((i) => i.sev === "crit"));
 });
 
 Deno.test("todoReport reports the optimal state when empty", () => {

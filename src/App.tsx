@@ -7,7 +7,7 @@
 // the full snapshot every 2s and the CPU sampler every 1s (kata: per-second CPU
 // history). A live "last refresh" age ticks via the cell polls.
 
-import { machine } from "./wasm.ts";
+import { machine, type View } from "./wasm.ts";
 import type {
   BoardInfo,
   CpuInfo,
@@ -67,37 +67,45 @@ const ago = (ms: number): string => {
   return `${m}m ${s % 60}s ago`;
 };
 
-// Solana brand palette (+ derived status hues)
+// Unified palette. ONE brand accent (violet) drives every panel's icon/title/
+// border, so the deck reads as a single product rather than a rainbow of
+// per-section hues. Status colours are reserved for semantics (temperature,
+// utilisation, posture) — green=good, amber=caution, red=alert, blue=info.
+// Values are CSS vars so `.app[data-theme]` swaps them (style.css palettes).
 const C = {
-  purple: "#9945FF",
-  green: "#14F195",
-  cyan: "#00C2FF",
-  pink: "#DC1FFF",
-  blue: "#4B7BFF",
-  bg: "#07070F",
-  panel: "#12121F",
-  panel2: "#16162A",
-  border: "#23233B",
-  text: "#E4E4F0",
-  dim: "#7A7A95",
-  dimmer: "#4A4A60",
-  warn: "#FFB020",
-  bad: "#FF5C7C",
-  ok: "#14F195",
-  track: "#20203a",
+  accent: "var(--accent)", // single brand accent — all panel icons/titles/borders
+  green: "var(--green)", // ok / nominal
+  lime: "var(--lime)", // kata: cores 25–50%
+  cyan: "var(--cyan)", // info / cool
+  blue: "var(--blue)", // info-neutral (secondary)
+  warn: "var(--warn)", // caution
+  bad: "var(--bad)", // alert
+  dim: "var(--dim)",
 };
+
+// translucent tint of a palette colour (borders) — works on var() values
+const tint = (color: string): string =>
+  `color-mix(in srgb, ${color} 33%, transparent)`;
 
 // kata: partition utilization — cyan <50%, green <75%, yellow <90%, red beyond
 const pctColor = (p: number): string =>
   p < 50 ? C.cyan : p < 75 ? C.green : p < 90 ? C.warn : C.bad;
 
-// kata: temperature — cyan below 50% of max, yellow 50–90%, red beyond
-const tempColor = (c: number, maxC = 100): string =>
-  c < maxC * 0.5 ? C.cyan : c <= maxC * 0.9 ? C.warn : C.bad;
+// Temperature thresholds (°C) — the single source for tempColor AND
+// computeHealth, so red ⇔ CRIT. kata: cyan below 50% of max, yellow 50–90%,
+// red beyond — crit IS 90% of max, so cool ends at crit × 5/9.
+type TempLimits = { warn: number; crit: number };
+const TEMP: Record<"cpu" | "gpu" | "dimm", TempLimits> = {
+  cpu: { warn: 80, crit: 90 },
+  gpu: { warn: 78, crit: 85 },
+  dimm: { warn: 80, crit: 90 },
+};
+const tempColor = (c: number, t: TempLimits = TEMP.cpu): string =>
+  c < (t.crit * 5) / 9 ? C.cyan : c < t.crit ? C.warn : C.bad;
 
 // kata: core box — cyan ≤25%, lime 25–50%, yellow 50–75%, red 75–100%
 const coreColor = (u: number): string =>
-  u <= 25 ? C.cyan : u <= 50 ? C.green : u <= 75 ? C.warn : C.bad;
+  u <= 25 ? C.cyan : u <= 50 ? C.lime : u <= 75 ? C.warn : C.bad;
 
 const clamp = (n: number, lo = 0, hi = 100): number =>
   Math.max(lo, Math.min(hi, n));
@@ -112,43 +120,43 @@ export const cleanHw = (s: string): string =>
     .replace(/\s*\[[0-9a-fA-F]{2,6}\]/g, "") // drop hex ids like [0600] [1022]
     .replace(/["']/g, "")
     .replace(/\s+/g, " ")
-    .trim();
+    .trim()
+    .replace(/^\[\]$/, ""); // a lone empty bracket pair is noise, not a name
 
 export const shortVendor = (s: string): string => {
   const b = s.match(/\[([A-Za-z][\w ]{0,11})\]/); // non-hex bracket = short brand
   if (b?.[1]) return b[1].trim();
   const first = cleanHw(s).split(/[\s,]/)[0];
-  return first || "—";
+  // A bare bracket pair ("[]") or empty token is not a vendor — show "—".
+  return first && first !== "[]" ? first : "—";
 };
 
-// device-class → emoji (lspci)
-export const pciEmoji = (cls: string): string => {
+// device-class → ICON_PATHS key (lspci)
+export const pciIcon = (cls: string): string => {
   const c = cls.toLowerCase();
-  if (/(vga|3d|display)/.test(c)) return "🎮";
-  if (/(ethernet|network)/.test(c)) return "🌐";
-  if (/(wireless|wifi|802\.11)/.test(c)) return "📶";
-  if (/(audio|multimedia|sound)/.test(c)) return "🔊";
-  if (/usb/.test(c)) return "🔌";
-  if (/(sata|nvme|storage|raid|ide)/.test(c)) return "💾";
-  if (/bridge/.test(c)) return "🧩";
-  if (/(smbus|serial|system peripheral)/.test(c)) return "🔧";
-  if (/encryption/.test(c)) return "🔐";
-  return "▪";
+  if (/(vga|3d|display)/.test(c)) return "gpu";
+  if (/(wireless|wifi|802\.11)/.test(c)) return "wifi";
+  if (/(ethernet|network)/.test(c)) return "net";
+  if (/(audio|multimedia|sound)/.test(c)) return "audio";
+  if (/usb/.test(c)) return "usb";
+  if (/(sata|nvme|storage|raid|ide)/.test(c)) return "storage";
+  if (/bridge/.test(c)) return "chip";
+  if (/(smbus|serial|system peripheral)/.test(c)) return "cog";
+  if (/encryption/.test(c)) return "key";
+  return "pci";
 };
 
-// device-name → emoji (lsusb)
-export const usbEmoji = (name: string): string => {
+// device-name → ICON_PATHS key (lsusb)
+export const usbIcon = (name: string): string => {
   const n = name.toLowerCase();
-  if (/keyboard/.test(n)) return "⌨️";
-  if (/mouse/.test(n)) return "🖱️";
-  if (/hub/.test(n)) return "🔀";
-  if (/(camera|webcam)/.test(n)) return "📷";
-  if (/(audio|headset|microphone|speaker)/.test(n)) return "🎧";
-  if (/bluetooth/.test(n)) return "🔵";
-  if (/(wireless|wifi|802\.11)/.test(n)) return "📶";
-  if (/(storage|disk|flash|card reader|nvme|ssd)/.test(n)) return "💾";
-  if (/(ethernet|network|lan)/.test(n)) return "🌐";
-  return "🔌";
+  if (/keyboard/.test(n)) return "keyboard";
+  if (/(camera|webcam)/.test(n)) return "camera";
+  if (/(audio|headset|microphone|speaker)/.test(n)) return "headset";
+  if (/bluetooth/.test(n)) return "bluetooth";
+  if (/(wireless|wifi|802\.11)/.test(n)) return "wifi";
+  if (/(storage|disk|flash|card reader|nvme|ssd)/.test(n)) return "storage";
+  if (/(ethernet|network|lan)/.test(n)) return "net";
+  return "usb";
 };
 
 // ── health / TODO detection ────────────────────────────────────────────────
@@ -160,7 +168,7 @@ export type Issue = { sev: Sev; icon: string; text: string };
 
 const SEV: Record<Sev, { color: string; tag: string; rank: number }> = {
   crit: { color: C.bad, tag: "CRIT", rank: 0 },
-  sec: { color: C.purple, tag: "SEC", rank: 1 },
+  sec: { color: C.accent, tag: "SEC", rank: 1 },
   warn: { color: C.warn, tag: "WARN", rank: 2 },
   info: { color: C.cyan, tag: "INFO", rank: 3 },
 };
@@ -209,13 +217,13 @@ export function computeHealth(s: HealthInput): Issue[] {
   }
   // ── cpu temp (HW) ──
   if (s.cpu && s.cpu.temp_c > 0) {
-    if (s.cpu.temp_c >= 90) {
+    if (s.cpu.temp_c >= TEMP.cpu.crit) {
       out.push({
         sev: "crit",
         icon: "🌡",
         text: `CPU running hot — ${s.cpu.temp_c.toFixed(0)}°C`,
       });
-    } else if (s.cpu.temp_c >= 80) {
+    } else if (s.cpu.temp_c >= TEMP.cpu.warn) {
       out.push({
         sev: "warn",
         icon: "🌡",
@@ -231,9 +239,9 @@ export function computeHealth(s: HealthInput): Issue[] {
       text: `Memory pressure — ${s.mem.used_pct.toFixed(0)}% used`,
     });
   }
-  if (s.mem && s.mem.temp_c >= 80) {
+  if (s.mem && s.mem.temp_c >= TEMP.dimm.warn) {
     out.push({
-      sev: "warn",
+      sev: s.mem.temp_c >= TEMP.dimm.crit ? "crit" : "warn",
       icon: "🌡",
       text: `DIMM hot — ${s.mem.temp_c.toFixed(0)}°C`,
     });
@@ -259,13 +267,13 @@ export function computeHealth(s: HealthInput): Issue[] {
   // ── gpu (HW) ──
   if (s.gpu) {
     s.gpu.gpus.forEach((g, i) => {
-      if (g.temp_c >= 85) {
+      if (g.temp_c >= TEMP.gpu.crit) {
         out.push({
           sev: "crit",
           icon: "🎮",
           text: `GPU${i} hot — ${g.temp_c.toFixed(0)}°C`,
         });
-      } else if (g.temp_c >= 78) {
+      } else if (g.temp_c >= TEMP.gpu.warn) {
         out.push({
           sev: "warn",
           icon: "🎮",
@@ -461,7 +469,7 @@ export const gpuReport = (info: GpuInfo | null): string =>
         const vram = g.mem_total_mb > 0
           ? `${(g.mem_used_mb / 1024).toFixed(1)} / ${
             (g.mem_total_mb / 1024).toFixed(1)
-          } GB (${pct((g.mem_used_mb / g.mem_total_mb) * 100)})`
+          } GiB (${pct((g.mem_used_mb / g.mem_total_mb) * 100)})`
           : "—";
         return [
           `- GPU ${i}: ${g.name}`,
@@ -478,7 +486,7 @@ export const diskReport = (info: DiskInfo | null): string =>
       "Root /",
       `${fmtBytes(info.root_used_b)} / ${fmtBytes(info.root_total_b)} (${
         pct(info.root_used_pct)
-      }), ${fmtBytes(info.root_total_b - info.root_used_b)} free`,
+      }), ${fmtBytes(info.root_avail_b)} free`,
     ),
     ...info.mounts.map((m) => li(m.mount, pct(m.used_pct))),
   ]);
@@ -492,11 +500,11 @@ export const netReport = (info: NetInfo | null): string =>
         info.firewall.active ? "active" : "inactive"
       })`,
     ),
-    info.speed && info.speed.link_max_mbps > 0 && li(
+    info.speed && li(
       "Link",
-      `↓${info.speed.rx_mbps.toFixed(1)} ↑${
-        info.speed.tx_mbps.toFixed(1)
-      } / ${info.speed.link_max_mbps} Mbps`,
+      `↓${info.speed.rx_mbps.toFixed(1)} ↑${info.speed.tx_mbps.toFixed(1)}${
+        info.speed.link_max_mbps > 0 ? ` / ${info.speed.link_max_mbps}` : ""
+      } Mbps`,
     ),
     li("Default route", info.default_route || "—"),
     li("Interfaces", summarizeAddrs(info.addrs).replace(/\n/g, "; ")),
@@ -606,35 +614,103 @@ export const fullReport = (s: ReportInput, issues: Issue[]): string => {
 // ── section icons ───────────────────────────────────────────────────────────
 // kata: every section has an svg image representing its area. 16×16 stroke
 // icons, currentColor so each inherits its panel's accent.
+// Unified SVG icon set — every glyph is a 16×16 1.5-unit stroke path drawn with
+// the SAME visual language (round caps/joins, open strokes), so panels, chips,
+// metrics, buttons and lists all read as one coherent product. `currentColor`
+// inherits the accent. No emoji.
 const ICON_PATHS: Record<string, string> = {
+  // sections
   cpu:
-    "M4.5 4.5h7v7h-7z M6.5 1.5v3 M9.5 1.5v3 M6.5 11.5v3 M9.5 11.5v3 M1.5 6.5h3 M1.5 9.5h3 M11.5 6.5h3 M11.5 9.5h3",
-  mem:
-    "M1.5 5h13v5.5h-13z M4.5 10.5v2.5 M8 10.5v2.5 M11.5 10.5v2.5 M5.5 5v2.5 M10.5 5v2.5",
+    "M3.5 3.5h9v9h-9z M6 1.5v2 M10 1.5v2 M6 12.5v2 M10 12.5v2 M1.5 6h2 M1.5 10h2 M12.5 6h2 M12.5 10h2",
+  mem: "M2 4.5h12v7H2z M2 6.5h12 M5 11.5v3 M8 11.5v3 M11 11.5v3",
   board:
-    "M1.5 1.5h13v13h-13z M4.5 4.5h4v4h-4z M11.5 11.5h1 M11.5 4.5h1 M4.5 11.5h1",
+    "M1.5 1.5h13v13h-13z M5 5h6v6H5z M5 13.5v1 M11 13.5v1 M1.5 9h1.5 M13 9h1.5",
   gpu:
-    "M1.5 4.5h13v7h-13z M4 11.5v2 M7 11.5v2 M10.5 8a2.5 2.5 0 1 0-5 0a2.5 2.5 0 1 0 5 0",
+    "M2 4.5h12v6H2z M4 10.5v3 M7.5 10.5v3 M11 10.5v3 M8 7.5a1.5 1.5 0 1 0 0 .001",
   disk:
-    "M14.5 8a6.5 6.5 0 1 0-13 0a6.5 6.5 0 1 0 13 0 M10 8a2 2 0 1 0-4 0a2 2 0 1 0 4 0",
+    "M15 7.5a7 7 0 1 1-14 0 7 7 0 0 1 14 0z M10 7.5a2 2 0 1 1-4 0 2 2 0 0 1 4 0z",
   net:
-    "M14.5 8a6.5 6.5 0 1 0-13 0a6.5 6.5 0 1 0 13 0 M1.5 8h13 M8 1.5c-3.5 4-3.5 9 0 13 M8 1.5c3.5 4 3.5 9 0 13",
-  pci: "M1.5 3.5h13v6h-13z M4 9.5v3 M11 9.5v2 M7 9.5v2.5",
-  usb:
-    "M8 1.5v10 M8 4.5l3.5 1.5v1.5 M8 7.5L4.5 9v1.5 M9.5 13a1.5 1.5 0 1 0-3 0a1.5 1.5 0 1 0 3 0",
-  todo:
-    "M2.5 2.5h11v11h-11z M4.8 5.4l1.3 1.3 2.2-2.4 M4.8 9.4l1.3 1.3 2.2-2.4 M10 5.5h2.5 M10 9.5h2.5",
+    "M15 7.5a7 7 0 1 1-14 0 7 7 0 0 1 14 0z M1.5 7.5h13 M8 1.5c-3.5 3.5-3.5 10 0 13.5 M8 1.5c3.5 3.5 3.5 10 0 13.5",
+  pci:
+    "M1.5 3.5h13v6h-13z M4 9.5v3 M8 9.5v2.5 M12 9.5v3 M5.5 6h.01 M8 6h.01 M10.5 6h.01",
+  usb: "M8 1.5v11 M8 4l3 1.5v1.5L8 6.5 5 7v1.5L8 7 M8 12.5l1.5 1.5h-3z",
+  todo: "M2.5 2.5h11v11h-11z M5 6h6 M5 9h4 M5 12h2",
+  all: "M2 2h5v5H2z M9 2h5v5H9z M2 9h5v5H2z M9 9h5v5H9z",
   sec:
-    "M8 1.5l5.5 2v4c0 3.5-2.3 6-5.5 7-3.2-1-5.5-3.5-5.5-7v-4z M5.8 8l1.6 1.6 3-3.2",
+    "M8 1.5l5.5 2v4c0 3.4-2.3 5.9-5.5 7-3.2-1.1-5.5-3.6-5.5-7v-4z M6 8l1.4 1.4 2.6-2.8",
+  // metric / status glyphs
+  temp:
+    "M8 1.5a1 1 0 0 0-1 1v6.3a3.5 3.5 0 1 0 2 0V2.5a1 1 0 0 0-1-1z M8 13.5v.01",
+  bolt: "M8.5 1.5L3.5 9h4l-1 5.5L12 7H8l.5-5.5z",
+  load: "M2 13.5h12 M4 13.5V8 M8 13.5V4 M12 13.5V6",
+  vram: "M2 2h12v12H2z M2 5h12 M5 8h2 M5 11h2",
+  ram: "M2 4h12v3H2z M2 9h12v3H2z M5 7v2 M9 7v2",
+  swap: "M8 1.5v9 M8 10.5L5 8 M8 10.5L11 8 M13 6.5V12a1.5 1.5 0 0 1-1.5 1.5h-7",
+  clock: "M8 1.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13z M8 4.5V8l2.5 1.5",
+  pulse: "M1.5 8h3l2-4 3 8 2-4h3",
+  shield: "M8 1.5l5.5 2v4c0 3.4-2.3 5.9-5.5 7-3.2-1.1-5.5-3.6-5.5-7v-4z",
+  lock: "M4.5 7.5V6a3.5 3.5 0 0 1 7 0v1.5 M2.5 7.5h11V14h-11z M8 10.5v1",
+  unlock: "M4.5 7.5V6a3.5 3.5 0 0 1 6.6-1.5 M2.5 7.5h11V14h-11z M8 10.5v1",
+  globe:
+    "M8 1.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13z M1.5 8h13 M8 1.5c2.5 2 2.5 11 0 13 M8 1.5C5.5 3.5 5.5 12.5 8 14.5",
+  warning: "M8 2l6 11H2z M8 6.5V9 M8 11v.01",
+  alert: "M8 2l6 11H2z M8 6.5V9 M8 11v.01",
+  threat: "M8 2l6 11H2z M6 8l4 4 M10 8l-4 4",
+  check: "M3 8.5l3.5 3.5L13 5",
+  info: "M8 1.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13z M8 7v4.5 M8 4.5v.01",
+  // hardware / device tags
+  chip: "M5.5 5.5h5v5h-5z M8 3v2.5 M8 10.5V13 M3 8h2.5 M10.5 8H13",
+  keyboard:
+    "M1.5 4.5h13v7h-13z M3 8h.01 M5.5 8h.01 M8 8h.01 M10.5 8h.01 M5 6.5h.01 M8 6.5h.01 M3.5 10.5h9",
+  camera:
+    "M1.5 4.5h4l1.5-2h4L12.5 4.5h2v8h-13z M8 8.5a2 2 0 1 0 0-4 2 2 0 0 0 0 4z",
+  audio:
+    "M2.5 6h2l3-3v10l-3-3h-2z M11 6a3 3 0 0 1 0 4 M12.8 4a5.5 5.5 0 0 1 0 8",
+  headset: "M4 10.5v-3a4 4 0 0 1 8 0v3 M2.5 10.5h1.5v4H2.5z M12 10.5h1.5v4H12z",
+  bluetooth: "M5 3l6 5.5-6 4.5V3z M5 3v10 M11 8l5-3.5 M11 8l5 3.5",
+  wifi:
+    "M8 12.5a.75.75 0 1 0 0 .01 M2.5 6a8.5 8.5 0 0 1 11 0 M4.8 8.5a5.5 5.5 0 0 1 6.4 0 M7 11a2 2 0 0 1 2 0",
+  storage: "M1.5 3.5h13v9h-13z M1.5 6h13 M4 5h.01 M7 5h.01",
+  drive: "M1.5 3.5h13v9h-13z M1.5 6h13 M4 8.5h.01 M7 8.5h.01 M10 8.5h.01",
+  port: "M1.5 4h13v3H1.5z M4 5.5h.01 M1.5 12h13",
+  folder: "M1.5 3.5h5l2 2h6v7h-13z",
+  refresh: "M13.5 8a5.5 5.5 0 1 1-1.6-3.9 M13.5 2.5V5.5H10.5",
+  copy: "M5.5 2.5h8v8h-8z M2.5 5.5h3v8h8",
+  sun:
+    "M8 4.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7z M8 1v1.5 M8 13.5V15 M1.5 8H3 M13 8h1.5 M3 3l1 1 M12 12l1 1 M3 13l1-1 M12 4l1-1",
+  moon: "M13.5 9.5A5.5 5.5 0 1 1 6.5 2.5 4.5 4.5 0 0 0 13.5 9.5z",
+  pause: "M5 2.5v11 M11 2.5v11",
+  play: "M5 2.5L12.5 8 5 13.5z",
+  kernel:
+    "M8 1.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13z M8 1.5a6.5 6.5 0 0 1 0 13 M1.5 8h13",
+  arch: "M4 3h8l4 5-4 5H4L0 8z M8 4.5l2.5 3.5L8 11.5 5.5 8z",
+  gauge: "M3.5 5.5A5 5 0 0 0 13 11 M8 8l3-3.5",
+  cog:
+    "M8 5.5a2.5 2.5 0 1 0 0 5 2.5 2.5 0 0 0 0-5z M6.5 1.5h3l.6 2 1.9.9 2-1 1.5 2.6-1.5 1.4v1.8l1.5 1.4-1.5 2.6-2-1-1.9.9-.6 2h-3l-.6-2-1.9-.9-2 1-1.5-2.6 1.5-1.4V6.4L2.5 5l1.5-2.6 2 1 1.9-.9z",
+  procs: "M4 2.5h8v3H4z M4 10.5h8v3H4z M4 6.5h8v3H4z",
+  os: "M2 3.5h12v9H2z M6 2.5v2 M10 2.5v2 M2 8h12",
+  link: "M6.5 9.5L9.5 6.5 M4 12l-2-2a3 3 0 0 1 4-4.5 M12 4l2 2a3 3 0 0 1-4 4.5",
+  server:
+    "M1.5 3.5h13v4H1.5z M1.5 10.5h13v4H1.5z M4 5.5h.01 M7 5.5h.01 M4 12.5h.01 M7 12.5h.01",
+  eye:
+    "M1.5 8s2.5-4.5 6.5-4.5S14.5 8 14.5 8s-2.5 4.5-6.5 4.5S1.5 8 1.5 8z M8 6a2 2 0 1 0 0 4 2 2 0 0 0 0-4z",
+  key:
+    "M13.5 6.5a3 3 0 0 1-4.2 2.8L6 12.5H3.5V10l3.2-3.3A3 3 0 1 1 13.5 6.5z M11 4.5v.01",
 };
 
-const Icon = ({ name }: { name: string }) => (
-  <svg class="panel-icon" viewBox="0 0 16 16" aria-hidden="true">
+const Icon = ({ name, size = 14 }: { name: string; size?: number }) => (
+  <svg
+    class="panel-icon"
+    width={size}
+    height={size}
+    viewBox="0 0 16 16"
+    aria-hidden="true"
+  >
     <path
-      d={ICON_PATHS[name] ?? ""}
+      d={ICON_PATHS[name] ?? ICON_PATHS.check}
       fill="none"
       stroke="currentColor"
-      stroke-width="1.2"
+      stroke-width="1.5"
       stroke-linecap="round"
       stroke-linejoin="round"
     />
@@ -722,12 +798,11 @@ const Ring = (
           cy="18"
           r={r}
           fill="none"
-          stroke={color}
           stroke-width="2.6"
           stroke-linecap="round"
           stroke-dasharray={`${p.toFixed(1)} ${(100 - p).toFixed(1)}`}
           stroke-dashoffset="25"
-          style={{ color }}
+          style={{ stroke: color, color }}
         />
         <text x="18" y="17.5" text-anchor="middle" class="ring-num">
           {Math.round(p)}
@@ -761,12 +836,11 @@ const Pie = ({ pct, color }: { pct: number; color: string }) => {
         cy="18"
         r={r}
         fill="none"
-        stroke={color}
         stroke-width="4"
         stroke-linecap="round"
         stroke-dasharray={`${p.toFixed(1)} ${(100 - p).toFixed(1)}`}
         stroke-dashoffset="25"
-        style={{ color }}
+        style={{ stroke: color, color }}
       />
       <text x="18" y="17.5" text-anchor="middle" class="pie-num">
         {Math.round(p)}%
@@ -780,7 +854,7 @@ const Pie = ({ pct, color }: { pct: number; color: string }) => {
 // chart, per-second history). Gradient area fill, baseline grid, a moving
 // current-value dot, and a soft glow — alive without being noisy.
 const Sparkline = (
-  { data, color = C.purple }: { data: number[]; color?: string },
+  { data, color = C.accent }: { data: number[]; color?: string },
 ) => {
   if (data.length < 2) return <div class="sparkline-empty" />;
   const w = 100;
@@ -808,8 +882,14 @@ const Sparkline = (
           id="spark-fill"
           {...{ x1: "0", y1: "0", x2: "0", y2: "1" }}
         >
-          <stop {...{ offset: "0%", stopColor: color, stopOpacity: "0.34" }} />
-          <stop {...{ offset: "100%", stopColor: color, stopOpacity: "0" }} />
+          <stop
+            {...{ offset: "0%", stopOpacity: "0.34" }}
+            style={{ stopColor: color }}
+          />
+          <stop
+            {...{ offset: "100%", stopOpacity: "0" }}
+            style={{ stopColor: color }}
+          />
         </linearGradient>
       </defs>
       {/* quartile grid — three faint rules so the line has a frame of reference */}
@@ -820,16 +900,16 @@ const Sparkline = (
       <polyline
         points={pts}
         fill="none"
-        stroke={color}
         stroke-width="1.6"
         vector-effect="non-scaling-stroke"
+        style={{ stroke: color }}
       />
       <circle
         class="spark-dot"
         cx={lx.toFixed(1)}
         cy={ly.toFixed(1)}
         r="2"
-        fill={color}
+        style={{ fill: color }}
       />
     </svg>
   );
@@ -838,16 +918,19 @@ const Sparkline = (
 // ── presentational primitives ───────────────────────────────────────────────
 
 const Metric = (
-  { label, value, sub, color, emoji }: {
+  { label, value, sub, color, icon }: {
     label: string;
     value: string;
     sub?: string;
     color?: string;
-    emoji?: string;
+    icon?: string;
   },
 ) => (
   <div class="metric">
-    <div class="metric-label">{emoji ? `${emoji} ` : ""}{label}</div>
+    <div class="metric-label">
+      {icon && <Icon name={icon} size={10} />}
+      {label}
+    </div>
     <div class="metric-value" style={color ? { color } : undefined}>
       {value}
     </div>
@@ -855,57 +938,64 @@ const Metric = (
   </div>
 );
 
+// Clipboard write from a click handler (browser-side, navigator.clipboard).
+// Brief `ok` class on success; on failure warns at the site and flashes
+// `copy-failed` (red ✗) — never a silent no-op.
+const copyText = (e: Event, text: string, ok: string) => {
+  const btn = e.currentTarget as HTMLElement;
+  const flash = (cls: string) => {
+    btn.classList.add(cls);
+    setTimeout(() => btn.classList.remove(cls), 1200);
+  };
+  const clip = globalThis.navigator?.clipboard;
+  (clip ? clip.writeText(text) : Promise.reject(new Error("no clipboard API")))
+    .then(() => flash(ok), (err) => {
+      console.warn("[machine] copy to clipboard failed:", err);
+      flash("copy-failed");
+    });
+};
+
 // Copy-to-clipboard button — writes a human-friendly report block (built per
-// section) to the clipboard. Runs entirely browser-side (onClick), so it uses
-// navigator.clipboard directly; brief ✓ feedback via a transient class.
-const CopyButton = ({ text }: { text: string }) => (
+// section) to the clipboard.
+const CopyButton = ({ text, label }: { text: string; label: string }) => (
   <button
     class="copy-btn"
     type="button"
-    aria-label="Copy"
+    aria-label={`Copy ${label}`}
     title="copy this section as text"
-    onClick={(e: Event) => {
-      const btn = e.currentTarget as HTMLButtonElement | null;
-      const clip = globalThis.navigator?.clipboard;
-      if (!clip || !btn) return;
-      clip.writeText(text).then(() => {
-        btn.classList.add("copied");
-        setTimeout(() => btn.classList.remove("copied"), 1200);
-      }).catch(() => {});
-    }}
+    onClick={(e: Event) => copyText(e, text, "copied")}
   >
-    <span class="copy-ic">📋</span>
-    <span class="copy-ok">✓</span>
+    <span class="copy-ic">
+      <Icon name="copy" size={11} />
+    </span>
+    <span class="copy-ok">
+      <Icon name="check" size={11} />
+    </span>
+    <span class="copy-err">✗</span>
   </button>
 );
 
 const Panel = (
-  { title, accent, icon, emoji, right, span, copy, children }: {
+  { title, accent, icon, right, copy, children }: {
     title: string;
     accent: string;
     icon?: string;
-    emoji?: string;
     right?: unknown;
-    span?: boolean;
     copy?: string;
     children: unknown;
   },
 ) => (
-  // --accent drives all accent-aware CSS (border, hairline, title, glow)
-  <div
-    class={span ? "panel panel-hero" : "panel"}
-    style={{ "--accent": accent }}
-  >
+  // --accent drives accent-aware CSS (title icon, badge)
+  <div class="panel" style={{ "--accent": accent }}>
     <div class="panel-head">
       <div class="panel-title">
         {icon && <Icon name={icon} />}
-        {emoji && <span class="panel-emoji">{emoji}</span>}
         {title}
       </div>
       {(right != null || copy != null) && (
         <div class="panel-right">
           {right}
-          {copy != null && <CopyButton text={copy} />}
+          {copy != null && <CopyButton text={copy} label={title} />}
         </div>
       )}
     </div>
@@ -918,7 +1008,7 @@ const Badge = ({ text, color = C.dim, dot }: {
   color?: string;
   dot?: boolean;
 }) => (
-  <span class="badge" style={{ color, borderColor: color + "55" }}>
+  <span class="badge" style={{ color, borderColor: tint(color) }}>
     {dot && <span class="badge-dot" style={{ background: color, color }} />}
     {text}
   </span>
@@ -947,14 +1037,14 @@ const Row = (
 );
 
 // A tiny inline "chip" for the header vitals + system strip.
-const Chip = ({ emoji, label, value, color }: {
-  emoji: string;
+const Chip = ({ icon, label, value, color }: {
+  icon: string;
   label: string;
   value: string;
   color?: string;
 }) => (
   <span class="chip" title={label}>
-    <span class="chip-emoji">{emoji}</span>
+    <Icon name={icon} size={11} />
     <span class="chip-label">{label}</span>
     <span class="chip-value" style={color ? { color } : undefined}>
       {value}
@@ -972,7 +1062,6 @@ const TodoPanel = ({ issues }: { issues: Issue[] }) => {
       title="TODO"
       accent={accent}
       icon="todo"
-      emoji="🩺"
       copy={todoReport(issues)}
       right={
         <Badge
@@ -987,7 +1076,18 @@ const TodoPanel = ({ issues }: { issues: Issue[] }) => {
           <div class="todos">
             {issues.map((it, i) => (
               <div class={`todo todo-${it.sev}`} key={i}>
-                <span class="todo-icon">{it.icon}</span>
+                <span class="todo-icon">
+                  <Icon
+                    name={it.sev === "crit"
+                      ? "threat"
+                      : it.sev === "sec"
+                      ? "shield"
+                      : it.sev === "warn"
+                      ? "warning"
+                      : "info"}
+                    size={13}
+                  />
+                </span>
                 <span class="todo-text">{it.text}</span>
                 <span class="todo-sev" style={{ color: SEV[it.sev].color }}>
                   {SEV[it.sev].tag}
@@ -996,7 +1096,11 @@ const TodoPanel = ({ issues }: { issues: Issue[] }) => {
             ))}
           </div>
         )
-        : <div class="todo-ok">✅ All systems optimal</div>}
+        : (
+          <div class="todo-ok">
+            <Icon name="check" size={13} /> All systems optimal
+          </div>
+        )}
     </Panel>
   );
 };
@@ -1010,52 +1114,66 @@ const CpuPanel = (
 ) => (
   <Panel
     title="CPU"
-    accent={C.purple}
+    accent={C.accent}
     icon="cpu"
-    emoji="🧠"
     copy={cpuReport(info, sys)}
     right={info
-      ? <Badge text={`${info.cores} thr`} color={C.purple} />
+      ? <Badge text={`${info.cores} thr`} color={C.accent} />
       : undefined}
   >
     {info
       ? (
         <>
           <div class="model">{info.model || "—"}</div>
-          <div class="cpu-top">
-            <Ring
-              value={info.util_pct}
-              color={coreColor(info.util_pct)}
-              label="util"
-              size={62}
-            />
-            <div class="cpu-stats">
-              <Metric
-                label="temp"
-                emoji="🌡"
-                value={temp(info.temp_c)}
-                color={tempColor(info.temp_c)}
+          <div class="cpu-hero">
+            <div class="cpu-gauge">
+              <Ring
+                value={info.util_pct}
+                color={coreColor(info.util_pct)}
+                label="util"
+                size={88}
               />
-              <Metric
-                label="freq"
-                emoji="⚡"
-                value={fmtMhz(sys?.cpu_mhz ?? 0)}
-                sub={sys?.cpu_max_mhz
-                  ? `↑ ${fmtMhz(sys.cpu_max_mhz)}`
-                  : undefined}
-                color={C.cyan}
-              />
-              <Metric
-                label="load"
-                emoji="📈"
-                value={sys ? sys.load1.toFixed(2) : "—"}
-                sub={sys
-                  ? `${sys.load5.toFixed(2)}·${sys.load15.toFixed(2)}`
-                  : undefined}
-              />
+              <div class="cpu-stats">
+                <Metric
+                  label="temp"
+                  icon="temp"
+                  value={temp(info.temp_c)}
+                  color={tempColor(info.temp_c)}
+                />
+                <Metric
+                  label="freq"
+                  icon="bolt"
+                  value={fmtMhz(sys?.cpu_mhz ?? 0)}
+                  sub={sys?.cpu_max_mhz
+                    ? `↑ ${fmtMhz(sys.cpu_max_mhz)}`
+                    : undefined}
+                  color={C.cyan}
+                />
+                <Metric
+                  label="load"
+                  icon="load"
+                  value={sys ? sys.load1.toFixed(2) : "—"}
+                  sub={sys
+                    ? `${sys.load5.toFixed(2)}·${sys.load15.toFixed(2)}`
+                    : undefined}
+                />
+              </div>
+            </div>
+            <div class="cpu-chart">
+              <div class="cpu-chart-head">
+                <span class="chart-title">history</span>
+                <span
+                  class="chart-live"
+                  style={{ color: coreColor(info.util_pct) }}
+                >
+                  {pct(info.util_pct)}
+                </span>
+              </div>
+              <div class="chart-box">
+                <Sparkline data={history} color={coreColor(info.util_pct)} />
+              </div>
             </div>
           </div>
-          <Sparkline data={history} color={C.purple} />
           {info.cores_util.length > 0 && (
             <>
               <div class="cores">
@@ -1077,7 +1195,7 @@ const CpuPanel = (
                   <i style={{ background: C.cyan }} />≤25
                 </span>
                 <span>
-                  <i style={{ background: C.green }} />50
+                  <i style={{ background: C.lime }} />50
                 </span>
                 <span>
                   <i style={{ background: C.warn }} />75
@@ -1107,9 +1225,8 @@ const MemPanel = (
   return (
     <Panel
       title="MEMORY"
-      accent={C.green}
+      accent={C.accent}
       icon="mem"
-      emoji="🧬"
       copy={memReport(info, dimms, sys)}
     >
       {info
@@ -1118,22 +1235,23 @@ const MemPanel = (
             <div class="metric-row">
               <Metric
                 label="used"
-                emoji="▓"
+                icon="ram"
                 value={fmtKb(info.used_kb)}
                 color={C.green}
               />
               <Metric label="total" value={fmtKb(info.total_kb)} />
               <Metric
                 label="free"
+                icon="drive"
                 value={fmtKb(info.available_kb)}
                 color={C.cyan}
               />
               {info.temp_c > 0 && (
                 <Metric
                   label="temp"
-                  emoji="🌡"
+                  icon="temp"
                   value={temp(info.temp_c)}
-                  color={tempColor(info.temp_c)}
+                  color={tempColor(info.temp_c, TEMP.dimm)}
                 />
               )}
             </div>
@@ -1149,7 +1267,9 @@ const MemPanel = (
             <div class="metric-sub">{pct(info.used_pct)} in use</div>
             {sys && sys.swap_total_kb > 0 && (
               <div class="swap">
-                <span class="swap-label">💾 swap</span>
+                <span class="swap-label">
+                  <Icon name="swap" size={10} /> swap
+                </span>
                 <Bar
                   value={swapPct}
                   max={100}
@@ -1188,9 +1308,8 @@ const BoardPanel = (
 ) => (
   <Panel
     title="MOTHERBOARD"
-    accent={C.cyan}
+    accent={C.accent}
     icon="board"
-    emoji="🧩"
     copy={boardReport(info, dimmCount, slotsTotal)}
   >
     {info
@@ -1214,8 +1333,28 @@ const BoardPanel = (
           <Row
             k="mem slots"
             v={slotsTotal > 0 ? `${dimmCount} / ${slotsTotal}` : "—"}
-            color={slotsTotal > 0 && dimmCount >= slotsTotal ? C.warn : C.green}
+            color={slotsTotal === 0
+              ? undefined
+              : dimmCount >= slotsTotal
+              ? C.warn
+              : C.green}
           />
+          {/* kata: every metric panel has a graphical element */}
+          {slotsTotal > 0 && (
+            <SegBar
+              value={dimmCount}
+              max={slotsTotal}
+              segs={slotsTotal}
+              color={C.accent}
+            />
+          )}
+          {slotsTotal === 0 && info.temps_c.length > 0 && (
+            <Bar
+              value={Math.max(...info.temps_c)}
+              max={100}
+              color={tempColor(Math.max(...info.temps_c))}
+            />
+          )}
           {info.temps_c.length > 0 && (
             <div class="row">
               <span class="row-k">temps</span>
@@ -1241,9 +1380,8 @@ const BoardPanel = (
 const GpuPanel = ({ info }: { info: GpuInfo | null }) => (
   <Panel
     title="GPU"
-    accent={C.pink}
+    accent={C.accent}
     icon="gpu"
-    emoji="🎮"
     copy={gpuReport(info)}
   >
     {info && info.gpus.length > 0
@@ -1264,25 +1402,25 @@ const GpuPanel = ({ info }: { info: GpuInfo | null }) => (
               <div class="gpu-stats">
                 <Metric
                   label="temp"
-                  emoji="🌡"
+                  icon="temp"
                   value={temp(g.temp_c)}
-                  color={tempColor(g.temp_c)}
+                  color={tempColor(g.temp_c, TEMP.gpu)}
                 />
                 <Metric
                   label="vram"
-                  emoji="🎞"
+                  icon="vram"
                   value={g.mem_total_mb
                     ? `${(g.mem_used_mb / 1024).toFixed(1)}/${
                       (g.mem_total_mb / 1024).toFixed(1)
-                    }G`
+                    } GiB`
                     : "—"}
-                  color={vramPct > 85 ? C.bad : C.pink}
+                  color={vramPct > 85 ? C.bad : C.accent}
                 />
               </div>
             </div>
             {g.mem_total_mb > 0 && (
               <>
-                <SegBar value={vramPct} max={100} color={C.pink} />
+                <SegBar value={vramPct} max={100} color={C.accent} />
                 <div class="metric-sub">vram {pct(vramPct)}</div>
               </>
             )}
@@ -1296,9 +1434,8 @@ const GpuPanel = ({ info }: { info: GpuInfo | null }) => (
 const DiskPanel = ({ info }: { info: DiskInfo | null }) => (
   <Panel
     title="DISK"
-    accent={C.blue}
+    accent={C.accent}
     icon="disk"
-    emoji="💽"
     copy={diskReport(info)}
   >
     {info
@@ -1319,7 +1456,7 @@ const DiskPanel = ({ info }: { info: DiskInfo | null }) => (
                 <Metric label="total" value={fmtBytes(info.root_total_b)} />
               </div>
               <div class="metric-sub">
-                {fmtBytes(info.root_total_b - info.root_used_b)} free on /
+                {fmtBytes(info.root_avail_b)} free on /
               </div>
             </div>
           </div>
@@ -1359,21 +1496,23 @@ export type PortGroup = {
   count: number;
 };
 export const groupPorts = (ports: SecInfo["ports"]): PortGroup[] => {
-  const by = new Map<string, { ports: typeof ports; exposed: boolean }>();
+  const by = new Map<
+    string,
+    { name: string; ports: typeof ports; exposed: boolean }
+  >();
   for (const p of ports) {
     const name = p.process || p.proto;
-    const key = `${name} ${p.exposed}`;
-    const g = by.get(key) ?? { ports: [], exposed: p.exposed };
+    const key = `${name}·${p.exposed ? 1 : 0}`;
+    const g = by.get(key) ?? { name, ports: [], exposed: p.exposed };
     g.ports.push(p);
     by.set(key, g);
   }
-  return [...by.entries()]
-    .map(([key, g]) => {
-      const name = key.split(" ")[0] ?? "";
+  return [...by.values()]
+    .map((g) => {
       return {
         label: g.ports.length === 1
-          ? `${name}:${g.ports[0]?.port}`
-          : `${name} ×${g.ports.length}`,
+          ? `${g.name}:${g.ports[0]?.port}`
+          : `${g.name} ×${g.ports.length}`,
         detail: g.ports.map((p) => `${p.proto} ${p.addr}:${p.port}`).join("\n"),
         exposed: g.exposed,
         count: g.ports.length,
@@ -1395,9 +1534,8 @@ const SecPanel = (
   return (
     <Panel
       title="SECURITY"
-      accent={C.pink}
+      accent={C.accent}
       icon="sec"
-      emoji="🛡"
       copy={secReport(sec, net)}
       right={sec
         ? (
@@ -1417,20 +1555,20 @@ const SecPanel = (
               <div class="sec-stats">
                 <Metric
                   label="checks"
-                  emoji="🧱"
+                  icon="shield"
                   value={`${passed}/${sec.checks.length}`}
                   color={passed === sec.checks.length ? C.green : C.warn}
                 />
                 <Metric
                   label="exposed"
-                  emoji="🚪"
+                  icon="globe"
                   value={String(exposed.length)}
                   sub={`${sec.ports.length} listening`}
                   color={exposed.length === 0 ? C.green : C.warn}
                 />
                 <Metric
                   label="threats"
-                  emoji="☠"
+                  icon="threat"
                   value={String(sec.procs.length)}
                   color={sec.procs.length === 0 ? C.green : C.bad}
                 />
@@ -1440,7 +1578,9 @@ const SecPanel = (
               <div class="sec-threats">
                 {sec.procs.map((p, i) => (
                   <div class="sec-threat" key={i} title={p.cmd}>
-                    <span class="sec-mark" style={{ color: C.bad }}>☠</span>
+                    <span class="sec-mark" style={{ color: C.bad }}>
+                      <Icon name="threat" size={12} />
+                    </span>
                     <span class="sec-check-label">
                       {p.pid} {p.user} · {p.reason}
                     </span>
@@ -1456,7 +1596,7 @@ const SecPanel = (
                       class="sec-mark"
                       style={{ color: c.ok ? C.green : C.bad }}
                     >
-                      {c.ok ? "✓" : "✗"}
+                      <Icon name={c.ok ? "check" : "alert"} size={12} />
                     </span>
                     <span class="sec-check-label">{c.label}</span>
                     <span
@@ -1477,13 +1617,14 @@ const SecPanel = (
                     key={i}
                     style={{
                       color: g.exposed ? C.warn : C.dim,
-                      borderColor: (g.exposed ? C.warn : C.dim) + "55",
+                      borderColor: tint(g.exposed ? C.warn : C.dim),
                     }}
                     title={`${g.detail}\n${
                       g.exposed ? "reachable from the network" : "loopback only"
                     }`}
                   >
-                    {g.exposed ? "🌐" : "🔒"} {g.label}
+                    <Icon name={g.exposed ? "globe" : "lock"} size={11} />{" "}
+                    {g.label}
                   </span>
                 ))}
               </div>
@@ -1495,12 +1636,20 @@ const SecPanel = (
   );
 };
 
+// Rate bar ceiling: the link speed when known; Wi-Fi/VPN report none (≤0),
+// so scale to the current peak with a 100 Mbps floor.
+const netCap = (sp: NetInfo["speed"]): number =>
+  sp.link_max_mbps > 0
+    ? sp.link_max_mbps
+    : Math.max(sp.rx_mbps, sp.tx_mbps, 100);
+const netUnit = (sp: NetInfo["speed"]): string =>
+  sp.link_max_mbps > 0 ? `/${sp.link_max_mbps} Mbps` : " Mbps";
+
 const NetPanel = ({ info }: { info: NetInfo | null }) => (
   <Panel
     title="NETWORK"
-    accent={C.green}
+    accent={C.accent}
     icon="net"
-    emoji="🛰"
     copy={netReport(info)}
   >
     {info
@@ -1509,42 +1658,42 @@ const NetPanel = ({ info }: { info: NetInfo | null }) => (
           <div class="metric-row">
             <Metric
               label="vpn"
-              emoji={info.vpn ? "🔒" : "🔓"}
+              icon={info.vpn ? "lock" : "unlock"}
               value={info.vpn ? "UP" : "down"}
               color={info.vpn ? C.green : C.dim}
             />
             <Metric
               label="firewall"
-              emoji="🛡"
+              icon="shield"
               value={info.firewall.backend}
               sub={info.firewall.active ? "active" : "inactive"}
               color={info.firewall.active ? C.green : C.warn}
             />
           </div>
-          {info.speed && info.speed.link_max_mbps > 0 && (
+          {info.speed && (
             <div class="net-speed">
               <div class="net-speed-row">
                 <span class="net-label">↓ rx</span>
                 <Bar
                   value={info.speed.rx_mbps}
-                  max={info.speed.link_max_mbps}
+                  max={netCap(info.speed)}
                   color={C.green}
                 />
                 <span class="net-val">
                   {info.speed.rx_mbps.toFixed(1)}
-                  <i>/{info.speed.link_max_mbps} Mbps</i>
+                  <i>{netUnit(info.speed)}</i>
                 </span>
               </div>
               <div class="net-speed-row">
                 <span class="net-label">↑ tx</span>
                 <Bar
                   value={info.speed.tx_mbps}
-                  max={info.speed.link_max_mbps}
+                  max={netCap(info.speed)}
                   color={C.cyan}
                 />
                 <span class="net-val">
                   {info.speed.tx_mbps.toFixed(1)}
-                  <i>/{info.speed.link_max_mbps} Mbps</i>
+                  <i>{netUnit(info.speed)}</i>
                 </span>
               </div>
             </div>
@@ -1583,7 +1732,6 @@ const ListPanel = <T extends { name?: string }>({
   title,
   accent,
   icon,
-  emoji,
   items,
   render,
   copy,
@@ -1591,7 +1739,6 @@ const ListPanel = <T extends { name?: string }>({
   title: string;
   accent: string;
   icon?: string;
-  emoji?: string;
   items: T[];
   render: (item: T, i: number) => unknown;
   copy?: string;
@@ -1600,7 +1747,6 @@ const ListPanel = <T extends { name?: string }>({
     title={title}
     accent={accent}
     icon={icon}
-    emoji={emoji}
     copy={copy}
     right={<Badge text={String(items.length)} color={accent} />}
   >
@@ -1626,9 +1772,9 @@ const BrandMark = () => (
         id="brand-grad"
         {...{ x1: "0", y1: "0", x2: "1", y2: "1" }}
       >
-        <stop {...{ offset: "0%", stopColor: C.purple }} />
-        <stop {...{ offset: "50%", stopColor: C.green }} />
-        <stop {...{ offset: "100%", stopColor: C.cyan }} />
+        <stop {...{ offset: "0%" }} style={{ stopColor: C.accent }} />
+        <stop {...{ offset: "50%" }} style={{ stopColor: C.green }} />
+        <stop {...{ offset: "100%" }} style={{ stopColor: C.cyan }} />
       </linearGradient>
     </defs>
     <rect
@@ -1692,9 +1838,25 @@ const BrandMark = () => (
 
 // ── root ────────────────────────────────────────────────────────────────────
 
+// Left-bar tabs, in card order. Icon keys are the cards' own header icons.
+const TABS: { id: View; icon: string; label: string }[] = [
+  { id: "all", icon: "all", label: "All" },
+  { id: "todo", icon: "todo", label: "Todo" },
+  { id: "cpu", icon: "cpu", label: "CPU" },
+  { id: "mem", icon: "mem", label: "Mem" },
+  { id: "board", icon: "board", label: "Board" },
+  { id: "gpu", icon: "gpu", label: "GPU" },
+  { id: "disk", icon: "disk", label: "Disk" },
+  { id: "sec", icon: "sec", label: "Sec" },
+  { id: "net", icon: "net", label: "Net" },
+  { id: "pci", icon: "pci", label: "PCI" },
+  { id: "usb", icon: "usb", label: "USB" },
+];
+
 export default function App() {
   const s = machine;
-  const age = ago(s.lastRefresh);
+  // nothing re-renders while paused, so a ticking age would freeze — say so
+  const age = s.paused ? "paused" : ago(s.lastRefresh);
   const refreshing = s.refreshing;
   const paused = s.paused;
   const sys = s.sys;
@@ -1706,6 +1868,100 @@ export default function App() {
   const cpuTemp = s.cpu?.temp_c ?? 0;
   const issues = computeHealth(s);
 
+  const view = s.view;
+  // every card, tagged with its tab id; "all" shows them all, a tab just one
+  const cards: [View, unknown][] = [
+    [
+      "todo",
+      <TodoPanel key="todo" issues={issues} />,
+    ],
+    [
+      "cpu",
+      <CpuPanel key="cpu" info={s.cpu} history={s.cpuUtilHistory} sys={sys} />,
+    ],
+    [
+      "mem",
+      <MemPanel key="mem" info={s.mem} dimms={s.dimms} sys={sys} />,
+    ],
+    [
+      "board",
+      <BoardPanel
+        key="board"
+        info={s.board}
+        dimmCount={s.dimms.length}
+        slotsTotal={s.memSlotsTotal}
+      />,
+    ],
+    [
+      "gpu",
+      <GpuPanel key="gpu" info={s.gpu} />,
+    ],
+    [
+      "disk",
+      <DiskPanel key="disk" info={s.disk} />,
+    ],
+    [
+      "sec",
+      <SecPanel key="sec" sec={s.sec} net={s.net} />,
+    ],
+    [
+      "net",
+      <NetPanel key="net" info={s.net} />,
+    ],
+    [
+      "pci",
+      <ListPanel
+        key="pci"
+        title="LSPCI"
+        accent={C.accent}
+        icon="pci"
+        items={s.lspci}
+        copy={lspciReport(s.lspci)}
+        render={(e) => {
+          // AMD/others often report the device as a bare "Device [id]"; the
+          // class ("Host bridge", "VGA compatible controller") is the useful
+          // label there, so fall back to it.
+          const dev = cleanHw(e.name);
+          const name = dev && dev !== "Device" ? dev : cleanHw(e.class);
+          return (
+            <>
+              <span class="dev-emoji">
+                <Icon name={pciIcon(e.class)} size={12} />
+              </span>
+              <span
+                class="dev-name"
+                title={`${cleanHw(e.class)} · ${cleanHw(e.vendor)}`}
+              >
+                {name}
+              </span>
+              <span class="dev-tag">{shortVendor(e.vendor)}</span>
+            </>
+          );
+        }}
+      />,
+    ],
+    [
+      "usb",
+      <ListPanel
+        key="usb"
+        title="LSUSB"
+        accent={C.accent}
+        icon="usb"
+        items={s.lsusb}
+        copy={lsusbReport(s.lsusb)}
+        render={(e) => (
+          <>
+            <span class="dev-emoji">
+              <Icon name={usbIcon(e.name)} size={12} />
+            </span>
+            <span class="dev-name" title={e.name}>{cleanHw(e.name)}</span>
+            <span class="dev-tag mono">{e.id}</span>
+          </>
+        )}
+      />,
+    ],
+  ];
+
   return (
     <div class="app" data-theme={theme}>
       <header class="header">
@@ -1714,34 +1970,35 @@ export default function App() {
           <div class="brand-text">
             <span class="brand-name">machine</span>
             <span class="brand-sub">
-              {sys?.hostname ? `🖥 ${sys.hostname}` : "hardware deck"}
+              {sys?.hostname ? <Icon name="server" size={9} /> : ""}
+              {sys?.hostname ? ` ${sys.hostname}` : "hardware deck"}
             </span>
           </div>
         </div>
 
         <div class="vitals">
           <Chip
-            emoji="🧠"
+            icon="cpu"
             label="cpu"
             value={pct(cpuUtil)}
             color={coreColor(cpuUtil)}
           />
           <Chip
-            emoji="🧬"
+            icon="mem"
             label="mem"
             value={pct(memUtil)}
             color={coreColor(memUtil)}
           />
           {s.gpu && s.gpu.gpus.length > 0 && (
             <Chip
-              emoji="🎮"
+              icon="gpu"
               label="gpu"
               value={pct(gpuUtil)}
               color={coreColor(gpuUtil)}
             />
           )}
           <Chip
-            emoji="🌡"
+            icon="temp"
             label="temp"
             value={temp(cpuTemp)}
             color={tempColor(cpuTemp)}
@@ -1752,23 +2009,18 @@ export default function App() {
           {s.wasmAvailable
             ? <Badge text="wasm" color={C.green} dot />
             : <Badge text="wasm off" color={C.warn} dot />}
-          <span class="age" title="last refresh">🕓 {age}</span>
+          <span class="age" title="last refresh">
+            <Icon name="clock" size={11} /> {age}
+          </span>
           <button
             class="ctrl"
             type="button"
             aria-label="CopyAll"
             title="copy full system report"
-            onClick={(e: Event) => {
-              const btn = e.currentTarget as HTMLButtonElement | null;
-              const clip = globalThis.navigator?.clipboard;
-              if (!clip || !btn) return;
-              clip.writeText(fullReport(s, issues)).then(() => {
-                btn.classList.add("copied-flash");
-                setTimeout(() => btn.classList.remove("copied-flash"), 1000);
-              }).catch(() => {});
-            }}
+            onClick={(e: Event) =>
+              copyText(e, fullReport(s, issues), "copied-flash")}
           >
-            📋
+            <Icon name="copy" size={14} />
           </button>
           <button
             class="ctrl"
@@ -1777,7 +2029,7 @@ export default function App() {
             title={theme === "dark" ? "switch to light" : "switch to dark"}
             onClick={() => machine.toggleTheme()}
           >
-            {theme === "dark" ? "☀" : "🌙"}
+            <Icon name={theme === "dark" ? "sun" : "moon"} size={14} />
           </button>
           <button
             class={paused ? "ctrl ctrl-on" : "ctrl"}
@@ -1786,33 +2038,32 @@ export default function App() {
             title={paused ? "resume auto-refresh" : "pause auto-refresh"}
             onClick={() => machine.togglePause()}
           >
-            {paused ? "▶" : "⏸"}
+            <Icon name={paused ? "play" : "pause"} size={14} />
           </button>
           <button
-            class="refresh"
+            class={refreshing ? "refresh busy" : "refresh"}
             type="button"
             aria-label="Refresh"
             title="refresh now"
             onClick={() => machine.refresh(true)}
-            disabled={refreshing}
           >
-            ↻
+            <Icon name="refresh" size={14} />
           </button>
         </div>
       </header>
 
       {sys && (
         <div class="sysbar">
-          <Chip emoji="🐧" label="kernel" value={sys.kernel || "—"} />
-          <Chip emoji="🧱" label="arch" value={sys.arch || "—"} />
+          <Chip icon="kernel" label="kernel" value={sys.kernel || "—"} />
+          <Chip icon="arch" label="arch" value={sys.arch || "—"} />
           <Chip
-            emoji="⏱"
+            icon="clock"
             label="uptime"
             value={fmtUptime(sys.uptime_s)}
             color={C.green}
           />
           <Chip
-            emoji="📊"
+            icon="pulse"
             label="load"
             value={`${sys.load1.toFixed(2)} · ${sys.load5.toFixed(2)} · ${
               sys.load15.toFixed(2)
@@ -1820,73 +2071,45 @@ export default function App() {
           />
           {sys.procs_total > 0 && (
             <Chip
-              emoji="🧵"
+              icon="procs"
               label="procs"
               value={`${sys.procs_running}/${sys.procs_total}`}
             />
           )}
           {sys.governor && (
-            <Chip emoji="⚙" label="governor" value={sys.governor} />
+            <Chip icon="cog" label="governor" value={sys.governor} />
           )}
         </div>
       )}
 
-      <main class="grid">
-        <TodoPanel issues={issues} />
-        <CpuPanel info={s.cpu} history={s.cpuUtilHistory} sys={sys} />
-        <MemPanel info={s.mem} dimms={s.dimms} sys={sys} />
-        <BoardPanel
-          info={s.board}
-          dimmCount={s.dimms.length}
-          slotsTotal={s.memSlotsTotal}
-        />
-        <GpuPanel info={s.gpu} />
-        <DiskPanel info={s.disk} />
-        <SecPanel sec={s.sec} net={s.net} />
-        <NetPanel info={s.net} />
-        <ListPanel
-          title="LSPCI"
-          accent={C.purple}
-          icon="pci"
-          emoji="🔗"
-          items={s.lspci}
-          copy={lspciReport(s.lspci)}
-          render={(e) => {
-            // AMD/others often report the device as a bare "Device [id]"; the
-            // class ("Host bridge", "VGA compatible controller") is the useful
-            // label there, so fall back to it.
-            const dev = cleanHw(e.name);
-            const name = dev && dev !== "Device" ? dev : cleanHw(e.class);
-            return (
-              <>
-                <span class="dev-emoji">{pciEmoji(e.class)}</span>
-                <span
-                  class="dev-name"
-                  title={`${cleanHw(e.class)} · ${cleanHw(e.vendor)}`}
-                >
-                  {name}
-                </span>
-                <span class="dev-tag">{shortVendor(e.vendor)}</span>
-              </>
-            );
-          }}
-        />
-        <ListPanel
-          title="LSUSB"
-          accent={C.pink}
-          icon="usb"
-          emoji="🔌"
-          items={s.lsusb}
-          copy={lsusbReport(s.lsusb)}
-          render={(e) => (
-            <>
-              <span class="dev-emoji">{usbEmoji(e.name)}</span>
-              <span class="dev-name" title={e.name}>{cleanHw(e.name)}</span>
-              <span class="dev-tag mono">{e.id}</span>
-            </>
-          )}
-        />
-      </main>
+      <div class="body">
+        <nav class="tabs" aria-label="cards">
+          {TABS.map((t) => (
+            <button
+              key={t.id}
+              class={t.id === view ? "tab tab-on" : "tab"}
+              type="button"
+              aria-label={`${t.label}Tab`}
+              aria-pressed={t.id === view}
+              title={t.id === "all" ? "show all cards" : `show only ${t.label}`}
+              onClick={() => machine.setView(t.id)}
+            >
+              <Icon name={t.icon} size={15} />
+              <span class="tab-label">{t.label}</span>
+              {t.id === "todo" && issues.length > 0 && <span class="tab-dot" />}
+            </button>
+          ))}
+        </nav>
+        <main class="grid">
+          {view === "all"
+            ? <div class="cards">{cards.map(([, card]) => card)}</div>
+            : (
+              <div class="cards single">
+                {cards.find(([id]) => id === view)?.[1]}
+              </div>
+            )}
+        </main>
+      </div>
     </div>
   );
 }

@@ -9,7 +9,7 @@
 // the #1 aio gotcha: a server-only import in a cell/index reaches the browser
 // and blanks the screen with "Deno is not defined".
 
-import { cell } from "aio";
+import { cell, schedule, self } from "aio";
 
 // ── types matching the Rust JSON shape ─────────────────────────────────────
 
@@ -64,6 +64,7 @@ export type DiskInfo = {
   root_total_b: number;
   root_used_b: number;
   root_used_pct: number;
+  root_avail_b: number; // df "Available" — excludes root-reserved blocks
   mounts: {
     mount: string;
     total_b: number;
@@ -81,7 +82,13 @@ export type NetInfo = {
   vpn: boolean;
   firewall: { backend: string; active: boolean };
   default_route: string;
-  speed: { link_max_mbps: number; rx_mbps: number; tx_mbps: number };
+  speed: {
+    link_max_mbps: number;
+    rx_mbps: number;
+    tx_mbps: number;
+    iface?: string;
+    ts?: number; // epoch ms the byte counters were read (host-stamped)
+  };
 };
 
 // Security posture — parsed by the Rust sys_sec syscall. Checks whose input
@@ -139,12 +146,30 @@ export type SysInfo = {
 // are awaited in parallel inside collectAll() so the loop never blocks on a
 // single slow read.
 
+// Left-bar tabs: "all" shows every card, any other id shows just that card.
+export const VIEWS = [
+  "all",
+  "todo",
+  "cpu",
+  "mem",
+  "board",
+  "gpu",
+  "disk",
+  "sec",
+  "net",
+  "pci",
+  "usb",
+] as const;
+export type View = typeof VIEWS[number];
+
 export type MachineState = {
   lastRefresh: number; // epoch ms
   refreshing: boolean;
+  refreshQueued: boolean; // a forced refresh arrived mid-flight — re-run after
   refreshingCpu: boolean; // re-entrancy guard for the 1s CPU sampler
   paused: boolean; // when true, scheduled polls skip; manual refresh still runs
   theme: "dark" | "light"; // UI theme, toggled from the header
+  view: View; // selected left-bar tab
   wasmAvailable: boolean;
   prevCpuStat: string; // previous /proc/stat aggregate line — for util delta
   prevCpuCoresStat: string[]; // previous per-core lines — for per-core util delta
@@ -186,13 +211,31 @@ function coresUtilPct(prev: string[], cur: string[]): number[] {
   return cur.map((cLine, i) => cpuUtilPct(prev[i] ?? "", cLine));
 }
 
+// Mbps from two raw byte-counter samples. [0, 0] on the first sample, when the
+// default interface changed (counters not comparable) or the clock stalled;
+// never negative (a counter reset reads as 0, not a dip).
+type NetSample = NonNullable<MachineState["prevNetBytes"]>;
+export function netRates(
+  prev: NetSample | null,
+  cur: NetSample,
+): [number, number] {
+  const dt = prev ? (cur.ts - prev.ts) / 1000 : 0;
+  if (!prev || dt <= 0 || (cur.iface && prev.iface !== cur.iface)) {
+    return [0, 0];
+  }
+  const mbps = (d: number) => Math.max(0, (d * 8) / dt / 1e6);
+  return [mbps(cur.rx - prev.rx), mbps(cur.tx - prev.tx)];
+}
+
 export const machine = cell("machine", {
   state: {
     lastRefresh: 0,
     refreshing: false,
+    refreshQueued: false,
     refreshingCpu: false,
     paused: false,
     theme: "dark",
+    view: "all",
     wasmAvailable: true,
     prevCpuStat: "",
     prevCpuCoresStat: [] as string[],
@@ -211,11 +254,29 @@ export const machine = cell("machine", {
     sys: null,
     sec: null,
   } as MachineState,
+  // Server-only scratch (delta baselines, raw /proc/stat lines, the sampler
+  // guard) never reaches the UI — keeps the 1s broadcast small.
+  visible: {
+    exclude: [
+      "prevCpuStat",
+      "prevCpuCoresStat",
+      "prevNetBytes",
+      "refreshingCpu",
+      "refreshQueued",
+      "cpu.stat",
+      "cpu.core_stats",
+    ],
+  },
+  // Live hardware state is never persisted; only the user's UI choices are.
+  persist: { include: ["theme", "view"] },
   methods: {
     // `force` is passed by the manual refresh button so a paused app can still
     // be refreshed on demand; scheduled polls call with no arg and are gated.
-    async refresh(s, force?: boolean) {
-      if (s.refreshing) return;
+    async refresh(s, force: boolean = false) {
+      if (s.refreshing) {
+        if (force) s.refreshQueued = true; // a manual click is never dropped
+        return;
+      }
       if (s.paused && !force) return;
       s.refreshing = true;
       try {
@@ -224,51 +285,26 @@ export const machine = cell("machine", {
         // never loads it, never sees Deno.*. Runs only on the server.
         const io = await import("./io.server.ts");
         const snap = await io.collectAll();
-        // CPU utilization from the delta of two /proc/stat samples (Linux).
-        // The Rust parser passes the raw stat line through; we compute the %
-        // here (host-side) and stamp it onto the CPU info before storing.
-        if (snap.cpu && io.PLATFORM === "linux") {
-          // Deliberate post-await read: /proc/stat counters are cumulative, so
-          // a delta against a prev sample the 1s CPU poll may have refreshed
-          // mid-await stays correct (reading the freshest prev is intended).
-          snap.cpu.util_pct = cpuUtilPct(s.prevCpuStat, snap.cpu.stat);
-          s.prevCpuStat = snap.cpu.stat;
-          snap.cpu.cores_util = coresUtilPct(
-            s.prevCpuCoresStat,
-            snap.cpu.core_stats,
-          );
-          s.prevCpuCoresStat = snap.cpu.core_stats;
-        }
+        // CPU is owned by refreshCpu (1s sampler) — a second /proc/stat delta
+        // here would land milliseconds after the sampler's and read ~0%. The
+        // delta baselines are scratch, so they go through s.$live (unwatched,
+        // never a commit conflict with the concurrent sampler).
+        const live = s.$live!;
         // Net speed: the I/O layer passes raw rx/tx BYTE COUNTS in
         // rx_mbps/tx_mbps (misnamed for transit — the Rust parser just forwards
         // them). The cell computes the actual Mbps rate from the delta between
         // samples, then stashes the raw counts for the next refresh.
-        if (snap.net && snap.net.speed) {
-          const rawRx = snap.net.speed.rx_mbps; // raw bytes (see io.server.ts)
-          const rawTx = snap.net.speed.tx_mbps;
-          if (s.prevNetBytes) {
-            const dt = (Date.now() - s.prevNetBytes.ts) / 1000;
-            if (dt > 0) {
-              snap.net.speed.rx_mbps = Math.max(
-                0,
-                ((rawRx - s.prevNetBytes.rx) * 8) / dt / 1e6,
-              );
-              snap.net.speed.tx_mbps = Math.max(
-                0,
-                ((rawTx - s.prevNetBytes.tx) * 8) / dt / 1e6,
-              );
-            } else {
-              snap.net.speed.rx_mbps = 0;
-              snap.net.speed.tx_mbps = 0;
-            }
-          } else {
-            // first sample — no rate yet
-            snap.net.speed.rx_mbps = 0;
-            snap.net.speed.tx_mbps = 0;
-          }
-          s.prevNetBytes = { iface: "", rx: rawRx, tx: rawTx, ts: Date.now() };
+        if (snap.net?.speed) {
+          const sp = snap.net.speed;
+          const cur = {
+            iface: sp.iface ?? "",
+            rx: sp.rx_mbps, // raw byte counts (see io.server.ts)
+            tx: sp.tx_mbps,
+            ts: sp.ts ?? Date.now(),
+          };
+          [sp.rx_mbps, sp.tx_mbps] = netRates(live.prevNetBytes, cur);
+          live.prevNetBytes = cur;
         }
-        s.cpu = snap.cpu;
         s.mem = snap.mem;
         s.dimms = snap.dimms;
         s.memSlotsTotal = snap.memSlotsTotal;
@@ -280,43 +316,52 @@ export const machine = cell("machine", {
         s.net = snap.net;
         s.sys = snap.sys;
         s.sec = snap.sec;
-        // (CPU history is owned by refreshCpu — the 1s sampler — so the
-        // sparkline stays strictly per-second; no push here.)
-        const anyNull = !snap.cpu || !snap.mem || !snap.board || !snap.gpu ||
-          !snap.disk || !snap.net;
-        s.wasmAvailable = !anyNull;
+        s.wasmAvailable = snap.wasmAvailable;
         s.lastRefresh = Date.now();
+        // a forced (manual/resume) refresh also samples CPU, even when paused
+        if (force) {
+          s.$do(schedule.next("machine.cpu.kick", self("refreshCpu", true)));
+        }
       } finally {
         s.refreshing = false;
+        if (s.$live!.refreshQueued) {
+          s.$live!.refreshQueued = false;
+          s.$do(schedule.next("machine.requeue", self("refresh", true)));
+        }
       }
     },
-    // Light 1s sampler: CPU only (kata: CPU line chart shows history per
-    // second). The full refresh stays at 2s — spawning lspci/df/dmidecode
-    // every second would waste host cycles for panels that barely change.
-    // /proc/stat counters are cumulative, so interleaved deltas with the
-    // full refresh stay correct regardless of interval.
-    async refreshCpu(s) {
-      if (s.refreshingCpu || s.paused) return;
+    // 1s sampler — the sole owner of s.cpu (kata: CPU line chart shows
+    // history per second). The full refresh stays at 2s — spawning
+    // lspci/df/dmidecode every second would waste host cycles.
+    async refreshCpu(s, force: boolean = false) {
+      if (s.refreshingCpu || (s.paused && !force)) return;
       s.refreshingCpu = true;
       try {
         const io = await import("./io.server.ts");
         const snap = await io.cpu();
         if (!snap) return;
+        const live = s.$live!;
+        const hadPrevStat = io.PLATFORM === "linux" && live.prevCpuStat !== "";
         if (io.PLATFORM === "linux") {
-          // Deliberate post-await read (see refresh): cumulative counters keep
-          // the delta correct even if the 2s poll refreshed prevCpuStat.
-          snap.util_pct = cpuUtilPct(s.prevCpuStat, snap.stat);
-          s.prevCpuStat = snap.stat;
-          snap.cores_util = coresUtilPct(s.prevCpuCoresStat, snap.core_stats);
-          s.prevCpuCoresStat = snap.core_stats;
+          snap.util_pct = cpuUtilPct(live.prevCpuStat, snap.stat);
+          live.prevCpuStat = snap.stat;
+          snap.cores_util = coresUtilPct(
+            live.prevCpuCoresStat,
+            snap.core_stats,
+          );
+          live.prevCpuCoresStat = snap.core_stats;
         }
         s.cpu = snap;
         // keep last 60 samples — .slice() (not spread): live async state
-        // doesn't expose Symbol.iterator; slice returns a plain snapshot array.
-        const hist = Array.isArray(s.cpuUtilHistory)
-          ? s.cpuUtilHistory.slice(-59)
-          : [];
-        hist.push(snap.util_pct);
+        // doesn't expose Symbol.iterator. Post-await read is safe: this method
+        // is the sole writer of cpuUtilHistory (refreshingCpu guard). // aio-ok
+        const hist = s.cpuUtilHistory.slice(-59);
+        // First sample has no prev baseline — cpuUtilPct returns a synthetic 0
+        // that would draw a false "idle" dip at the start of the sparkline.
+        // Drop it; real readings begin from the second sample. (Capture the
+        // flag before prevCpuStat was advanced above.)
+        const wasBaseline = hist.length === 0 && !hadPrevStat;
+        if (!wasBaseline) hist.push(snap.util_pct);
         s.cpuUtilHistory = hist;
       } finally {
         s.refreshingCpu = false;
@@ -326,7 +371,14 @@ export const machine = cell("machine", {
     // the UI doesn't wait up to 2s for the next scheduled tick.
     togglePause(s) {
       s.paused = !s.paused;
-      if (!s.paused) machine.refresh(true);
+      if (!s.paused) {
+        s.$do(schedule.next("machine.resume", self("refresh", true)));
+      }
+    },
+    setView(s, view: View) {
+      // a wire call can carry any string — refuse what no tab shows
+      if (!VIEWS.includes(view)) throw new Error(`unknown view "${view}"`);
+      s.view = view;
     },
     toggleTheme(s) {
       s.theme = s.theme === "dark" ? "light" : "dark";

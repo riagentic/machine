@@ -1,6 +1,5 @@
 # build artifacts
 dist/
-rust/pkg/
 rust/target/
 node_modules/
 *.AppImage

@@ -16,24 +16,26 @@ truth): `.katana/machine.md`. More detail: `AGENTS.md`, aio internals:
 - **Deno 2.9+ + aio framework** (vendored at `dep/aio` → symlink to sibling
   `../../aio`). Never `npm`/`node`.
 - JSX via `jsxImportSource: "aio"`; state via `cell({ state, methods })`
-  (methods-only since alpha27 — no `actions:`/`reduce:`/`execute:`).
-- Persistence is SQLite-only (`data.db`, since alpha28) — no unstable flags;
-  periphery symbols import from `aio/extras`.
+  (methods-only; effects via `s.$do(...)`, own-cell actions via `self()`).
+- aio **1.0.20-beta**, pinned `path:` to the sibling checkout (`.aio/pin.local`,
+  `am pin`). Version = deno.json `"version": "0.2"`; build number from git.
+- Persistence: SQLite (`~/.machine/data`); only `theme` persists
+  (`persist: { include }`). Server-only scratch is hidden via `visible.exclude`.
 - Rust crate `machine-sys` in `rust/`, target `wasm32-unknown-unknown`.
 
 ## Commands
 
-- `deno task dev` — run app (`deno task dev:browser` for browser client)
-- `deno task wasm` — build Rust → `src/syscalls.wasm` (required once, else UI
-  shows degraded "wasm off" state)
+- `deno task dev` — run app (`deno task dev --client=browser` for browser)
+- `deno task wasm` (`scripts/wasm.ts`) — build Rust → `src/syscalls.wasm`
+  (required once, else UI shows degraded "wasm off" state)
 - `deno task test` — all tests; single file: `deno test -A test/ui.test.ts`
 - `deno run -A dep/aio/aiol/mod.ts .` — aiol, the aio framework linter (flags
   removed config keys / moved imports after aio upgrades)
 - `cd rust && cargo test` — Rust parser unit tests (plain string fixtures)
-- `deno task am` — app manager: start/stop/status/logs; `am surface 0 --json` =
-  live UI perception, `am trigger 0 "<path>" <action>` = drive it
-- `deno task compile` / `compile:electron` / `compile:android`;
-  `deno task doctor` — config sanity
+- `deno task am` — app manager: start/stop/status/logs; `am surface --json` =
+  live UI perception, `am trigger "<Comp:Name>" <action>` = drive it
+- `deno task compile` (Electron) / `deno task build` (all `build.targets`);
+  `deno task doctor` — config sanity; `deno task am fix` — repair config
 - Verification gate (pre-merge, in order): `deno fmt --check` → `deno lint` →
   `deno check` → `deno test`
 
