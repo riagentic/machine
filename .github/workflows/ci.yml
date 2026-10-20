@@ -1,0 +1,33 @@
+name: ci
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: riagentic/aio
+          ref: v1.0.22-beta
+          path: dep/aio
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.9.7
+      - run: rustup target add wasm32-unknown-unknown
+      - run: deno task wasm
+      - name: fmt · lint · check · cargo test
+        if: runner.os == 'Linux'
+        run: |
+          deno fmt --check
+          deno lint
+          deno check src/ test/
+          cd rust && cargo test
+      - run: deno test -A test/

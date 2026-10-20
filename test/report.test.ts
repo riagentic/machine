@@ -12,6 +12,8 @@ import {
   gpuReport,
   groupPorts,
   type HealthInput,
+  hwReport,
+  hwSpec,
   lspciReport,
   netReport,
   pciIcon,
@@ -291,6 +293,7 @@ Deno.test("computeHealth: no swap only warns under memory pressure", () => {
     kernel: "",
     arch: "",
     os: "linux",
+    os_name: "",
     uptime_s: 60,
     load1: 0,
     load5: 0,
@@ -407,4 +410,94 @@ Deno.test("report builders never throw on all-null state", () => {
   // exercises every builder path via the section reports
   assertStringIncludes(cpuReport(nullState.cpu, nullState.sys), "no data");
   assertStringIncludes(lspciReport(nullState.lspci), "lspci · 0");
+});
+
+Deno.test("hwSpec: empty state → no sections, report says no data", () => {
+  const empty: ReportInput = {
+    cpu: null,
+    mem: null,
+    dimms: [],
+    memSlotsTotal: 0,
+    board: null,
+    gpu: null,
+    disk: null,
+    net: null,
+    sys: null,
+    sec: null,
+    lspci: [],
+    lsusb: [],
+  };
+  assertEquals(hwSpec(empty), []);
+  assertStringIncludes(hwReport([]), "no data");
+});
+
+Deno.test("hwSpec lists static inventory, drops blanks and loopback", () => {
+  const spec = hwSpec({
+    cpu: {
+      model: "AMD Ryzen 9 7950X",
+      cores: 32,
+      stat: "",
+      core_stats: [],
+      temp_c: 50,
+      util_pct: 10,
+      cores_util: [],
+    },
+    mem: null,
+    dimms: [{
+      locator: "DIMM_A1",
+      size: "32 GB",
+      speed: "6000 MT/s",
+      type: "DDR5",
+    }],
+    memSlotsTotal: 4,
+    board: null,
+    gpu: {
+      gpus: [{
+        name: "RTX 4090",
+        temp_c: 0,
+        util_pct: 0,
+        mem_total_mb: 24576,
+        mem_used_mb: 0,
+      }],
+    },
+    disk: null,
+    net: {
+      addrs: [{ ifname: "lo" }, { ifname: "eth0" }],
+      links: [],
+      vpn: false,
+      firewall: { backend: "", active: false },
+      default_route: "",
+      speed: { link_max_mbps: 1000, rx_mbps: 0, tx_mbps: 0 },
+    },
+    sys: null,
+    sec: null,
+    lspci: [],
+    lsusb: [{
+      bus: "001",
+      dev: "002",
+      id: "046d:c52b",
+      name: "Logitech Receiver",
+    }],
+  });
+  assertEquals(spec.map((s) => s.title), [
+    "CPU",
+    "Memory",
+    "GPU",
+    "Network",
+    "USB · 1",
+  ]);
+  assertEquals(spec[0]?.rows, [["model", "AMD Ryzen 9 7950X"], [
+    "threads",
+    "32",
+  ]]);
+  assertEquals(spec[1]?.rows, [["slots", "1 / 4"], [
+    "DIMM_A1",
+    "32 GB DDR5 6000 MT/s",
+  ]]);
+  assertEquals(spec[2]?.rows, [["gpu 0", "RTX 4090 · 24.0 GiB"]]);
+  assertEquals(spec[3]?.rows, [["interfaces", "eth0"], [
+    "link max",
+    "1000 Mbps",
+  ]]);
+  assertStringIncludes(hwReport(spec), "- 046d:c52b: Logitech Receiver");
 });

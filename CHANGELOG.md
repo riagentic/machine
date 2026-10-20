@@ -4,6 +4,38 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims
 to adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.4] — 2026-10-20
+
+### Added
+
+- **HW tab**: one card with the whole hardware inventory — system, CPU, RAM
+  sticks, board/BIOS, GPUs (+VRAM), drives, network, PCI and USB; copyable.
+- Windows/macOS: per-core CPU load (native counters via FFI), RAM sticks and
+  slots, uptime, swap, OS name, network speed, VPN detection, real USB ids, GPU
+  VRAM and (where attributable) GPU load; Windows pending-reboot, BitLocker,
+  real-time antivirus and Secure Boot checks without admin; macOS FileVault and
+  application-firewall state.
+- CI on Linux, Windows and macOS: unit tests for every OS mapper plus a live
+  test that reads the real runner's hardware.
+
+### Changed
+
+- Windows no longer starts PowerShell per query (~8 per refresh, one per CPU
+  sample): one long-lived session, static facts read once, slow ones cached.
+- macOS CPU sampling no longer runs `top` (1s per sample).
+- OS row shows the real name ("Ubuntu 24.04 LTS", "Windows 11 Pro").
+- aio 1.0.22-beta; lockfile synced to the pinned Electron 44.9.0. README
+  compacted; screenshot removed (it showed real machine data).
+
+### Fixed
+
+- Windows network names showed "?" (wrong JSON shape), and one adapter showed
+  "—" (PowerShell flattens one-item lists).
+- Windows showed a fake 0.00 load average — now hidden there.
+- macOS disk showed the sealed system volume as "/" (a few GB used) instead of
+  the data volume; system volumes no longer listed.
+- macOS USB list included buses and hubs as devices.
+
 ## [0.3.3] — 2026-10-18
 
 ### Changed

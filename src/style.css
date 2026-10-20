@@ -1485,3 +1485,21 @@ body {
     grid-template-columns: 1fr;
   }
 }
+
+/* HW tab: spec-sheet sections; a wide single card flows them into columns */
+.hw {
+  columns: 280px;
+  column-gap: 18px;
+}
+.hw-sec {
+  break-inside: avoid;
+  margin-bottom: 10px;
+}
+.hw-head {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--accent);
+  font-weight: 600;
+  margin-bottom: 3px;
+}

@@ -107,6 +107,10 @@ const tempColor = (c: number, t: TempLimits = TEMP.cpu): string =>
 const coreColor = (u: number): string =>
   u <= 25 ? C.cyan : u <= 50 ? C.lime : u <= 75 ? C.warn : C.bad;
 
+// Windows has no load average (the host leaves it 0) — never show a fake 0.00
+const hasLoad = (sys: SysInfo | null): sys is SysInfo =>
+  sys !== null && sys.os !== "windows";
+
 const clamp = (n: number, lo = 0, hi = 100): number =>
   Math.max(lo, Math.min(hi, n));
 
@@ -418,7 +422,7 @@ export const cpuReport = (info: CpuInfo | null, sys: SysInfo | null): string =>
         sys.cpu_max_mhz ? ` (max ${fmtMhz(sys.cpu_max_mhz)})` : ""
       }`,
     ),
-    sys && li(
+    hasLoad(sys) && li(
       "Load avg",
       `${sys.load1.toFixed(2)} / ${sys.load5.toFixed(2)} / ${
         sys.load15.toFixed(2)
@@ -581,6 +585,134 @@ export const lsusbReport = (items: { id: string; name: string }[]): string =>
     `Plugged devices (lsusb · ${items.length})`,
     items.map((e) => `- ${cleanHw(e.name)} [${e.id}]`),
   );
+
+// ── hardware inventory ─────────────────────────────────────────────────────
+// Static spec sheet (what the box IS, not how busy it is): pure sections of
+// key/value rows. Empty values are dropped. Both the HW card and its copy
+// text derive from this one list.
+export type HwSection = {
+  title: string;
+  icon: string;
+  rows: [string, string][];
+};
+
+export const hwSpec = (s: ReportInput): HwSection[] => {
+  const kv = (rows: [string, string | undefined][]): [string, string][] =>
+    rows.map(([k, v]): [string, string] => [k, v?.trim() ?? ""])
+      .filter(([, v]) => v);
+  const ifaces = Array.isArray(s.net?.addrs)
+    ? (s.net.addrs as { ifname?: string }[]).map((a) => a.ifname ?? "")
+      .filter((n) => n && n !== "lo")
+    : [];
+  return [
+    {
+      title: "System",
+      icon: "os",
+      rows: kv([
+        ["host", s.sys?.hostname],
+        ["os", s.sys?.os_name || s.sys?.os],
+        ["kernel", s.sys?.kernel],
+        ["arch", s.sys?.arch],
+      ]),
+    },
+    {
+      title: "CPU",
+      icon: "cpu",
+      rows: kv([
+        ["model", s.cpu?.model],
+        ["threads", s.cpu?.cores ? String(s.cpu.cores) : ""],
+        ["max freq", s.sys?.cpu_max_mhz ? fmtMhz(s.sys.cpu_max_mhz) : ""],
+        ["governor", s.sys?.governor],
+      ]),
+    },
+    {
+      title: "Memory",
+      icon: "mem",
+      rows: kv([
+        ["total", s.mem ? fmtKb(s.mem.total_kb) : ""],
+        ["swap", s.sys?.swap_total_kb ? fmtKb(s.sys.swap_total_kb) : ""],
+        [
+          "slots",
+          s.memSlotsTotal > 0 ? `${s.dimms.length} / ${s.memSlotsTotal}` : "",
+        ],
+        ...s.dimms.map((d, i): [string, string] => [
+          d.locator || `DIMM ${i}`,
+          `${d.size} ${d.type} ${d.speed}`.trim(),
+        ]),
+      ]),
+    },
+    {
+      title: "Board",
+      icon: "board",
+      rows: kv([
+        [
+          "board",
+          `${s.board?.board_vendor ?? ""} ${s.board?.board_name ?? ""}`,
+        ],
+        ["version", s.board?.board_version],
+        ["product", s.board?.product_name],
+        [
+          "bios",
+          `${s.board?.bios_vendor ?? ""} ${s.board?.bios_version ?? ""}`,
+        ],
+        ["bios date", s.board?.bios_date],
+        ["usb ports", s.board?.usb_ports ? String(s.board.usb_ports) : ""],
+      ]),
+    },
+    {
+      title: "GPU",
+      icon: "gpu",
+      rows: kv((s.gpu?.gpus ?? []).map((g, i): [string, string] => [
+        `gpu ${i}`,
+        `${g.name}${
+          g.mem_total_mb > 0
+            ? ` · ${(g.mem_total_mb / 1024).toFixed(1)} GiB`
+            : ""
+        }`,
+      ])),
+    },
+    {
+      title: "Storage",
+      icon: "disk",
+      // every OS lists its root ("/" or "C:") among the mounts
+      rows: kv((s.disk?.mounts ?? []).map((m): [string, string] => [
+        m.mount,
+        fmtBytes(m.total_b),
+      ])),
+    },
+    {
+      title: "Network",
+      icon: "net",
+      rows: kv([
+        ["interfaces", ifaces.join(", ")],
+        [
+          "link max",
+          s.net?.speed.link_max_mbps ? `${s.net.speed.link_max_mbps} Mbps` : "",
+        ],
+      ]),
+    },
+    {
+      title: `PCI · ${s.lspci.length}`,
+      icon: "pci",
+      rows: kv(s.lspci.map((e): [string, string] => {
+        const dev = cleanHw(e.name);
+        return [
+          shortVendor(e.vendor),
+          dev && dev !== "Device" ? dev : cleanHw(e.class),
+        ];
+      })),
+    },
+    {
+      title: `USB · ${s.lsusb.length}`,
+      icon: "usb",
+      rows: kv(s.lsusb.map((e): [string, string] => [e.id, cleanHw(e.name)])),
+    },
+  ].filter((sec) => sec.rows.length > 0);
+};
+
+export const hwReport = (spec: HwSection[]): string =>
+  spec.map((sec) => rpt(sec.title, sec.rows.map(([k, v]) => li(k, v))))
+    .join("\n\n") || rpt("Hardware", [li("status", "no data")]);
 
 // Whole-machine report — every section stitched together for a one-click
 // "share my spec / attach to a bug report" dump.
@@ -1152,8 +1284,8 @@ const CpuPanel = (
                 <Metric
                   label="load"
                   icon="load"
-                  value={sys ? sys.load1.toFixed(2) : "—"}
-                  sub={sys
+                  value={hasLoad(sys) ? sys.load1.toFixed(2) : "—"}
+                  sub={hasLoad(sys)
                     ? `${sys.load5.toFixed(2)}·${sys.load15.toFixed(2)}`
                     : undefined}
                 />
@@ -1298,6 +1430,25 @@ const MemPanel = (
     </Panel>
   );
 };
+
+const HwPanel = ({ spec, copy }: { spec: HwSection[]; copy: string }) => (
+  <Panel title="HARDWARE" accent={C.accent} icon="chip" copy={copy}>
+    {spec.length > 0
+      ? (
+        <div class="hw">
+          {spec.map((sec) => (
+            <div class="hw-sec" key={sec.title}>
+              <div class="hw-head">
+                <Icon name={sec.icon} size={11} /> {sec.title}
+              </div>
+              {sec.rows.map(([k, v], i) => <Row key={i} k={k} v={v} />)}
+            </div>
+          ))}
+        </div>
+      )
+      : <div class="empty">no hardware data</div>}
+  </Panel>
+);
 
 const BoardPanel = (
   { info, dimmCount, slotsTotal }: {
@@ -1841,6 +1992,7 @@ const BrandMark = () => (
 // Left-bar tabs, in card order. Icon keys are the cards' own header icons.
 const TABS: { id: View; icon: string; label: string }[] = [
   { id: "all", icon: "all", label: "All" },
+  { id: "hw", icon: "chip", label: "HW" },
   { id: "todo", icon: "todo", label: "Todo" },
   { id: "cpu", icon: "cpu", label: "CPU" },
   { id: "mem", icon: "mem", label: "Mem" },
@@ -1869,8 +2021,14 @@ export default function App() {
   const issues = computeHealth(s);
 
   const view = s.view;
-  // every card, tagged with its tab id; "all" shows them all, a tab just one
+  const hw = hwSpec(s);
+  // every card, tagged with its tab id; "all" shows them all (bar the HW
+  // summary, which only repeats them), a tab just one
   const cards: [View, unknown][] = [
+    [
+      "hw",
+      <HwPanel key="hw" spec={hw} copy={hwReport(hw)} />,
+    ],
     [
       "todo",
       <TodoPanel key="todo" issues={issues} />,
@@ -2062,13 +2220,15 @@ export default function App() {
             value={fmtUptime(sys.uptime_s)}
             color={C.green}
           />
-          <Chip
-            icon="pulse"
-            label="load"
-            value={`${sys.load1.toFixed(2)} · ${sys.load5.toFixed(2)} · ${
-              sys.load15.toFixed(2)
-            }`}
-          />
+          {hasLoad(sys) && (
+            <Chip
+              icon="pulse"
+              label="load"
+              value={`${sys.load1.toFixed(2)} · ${sys.load5.toFixed(2)} · ${
+                sys.load15.toFixed(2)
+              }`}
+            />
+          )}
           {sys.procs_total > 0 && (
             <Chip
               icon="procs"
@@ -2102,7 +2262,11 @@ export default function App() {
         </nav>
         <main class="grid">
           {view === "all"
-            ? <div class="cards">{cards.map(([, card]) => card)}</div>
+            ? (
+              <div class="cards">
+                {cards.filter(([id]) => id !== "hw").map(([, card]) => card)}
+              </div>
+            )
             : (
               <div class="cards single">
                 {cards.find(([id]) => id === view)?.[1]}

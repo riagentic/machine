@@ -1,7 +1,10 @@
 import { assertEquals } from "@std/assert";
 import { runCmd, sshdConfig } from "../src/io.server.ts";
 
-Deno.test("runCmd: SIGKILLs a SIGTERM-ignoring child on timeout", async () => {
+Deno.test({
+  name: "runCmd: SIGKILLs a SIGTERM-ignoring child on timeout",
+  ignore: Deno.build.os === "windows", // needs a POSIX sh + signals
+}, async () => {
   const t0 = Date.now();
   const out = await runCmd(["sh", "-c", "trap '' TERM; sleep 5; echo late"], {
     timeoutMs: 200,
@@ -15,7 +18,10 @@ Deno.test("runCmd: missing binary resolves empty", async () => {
   assertEquals(await runCmd(["machine-no-such-binary"]), "");
 });
 
-Deno.test("sshdConfig: inlines sorted Include matches at their position", async () => {
+Deno.test({
+  name: "sshdConfig: inlines sorted Include matches at their position",
+  ignore: Deno.build.os === "windows", // sshd_config paths are POSIX
+}, async () => {
   const dir = await Deno.makeTempDir();
   await Deno.mkdir(`${dir}/d`);
   await Deno.writeTextFile(`${dir}/d/20-b.conf`, "PermitRootLogin yes");

@@ -279,6 +279,459 @@ export async function runCmd(
   }
 }
 
+// Static facts: keep a good answer forever; a failed one (null) retries after
+// retryMs, so one cold/slow first read never sticks for the whole run.
+function onceOk<T>(
+  fn: () => Promise<T | null>,
+  fallback: T,
+  retryMs = 60_000,
+): () => Promise<T> {
+  let p: Promise<T | null> | null = null;
+  let failedAt = 0;
+  return async () => {
+    if (!p && Date.now() - failedAt < retryMs) return fallback;
+    p ??= fn();
+    const v = await p;
+    if (v !== null) return v;
+    p = null;
+    failedAt = Date.now();
+    return fallback;
+  };
+}
+
+// PowerShell JSON flattens a one-item array to the bare item and an empty
+// one to null — normalize every list it hands back.
+export const toArr = <T>(v: T | T[] | null | undefined): T[] =>
+  v == null ? [] : Array.isArray(v) ? v : [v];
+
+function parseJson<T>(site: string, text: string): T | null {
+  if (!text) return null;
+  try {
+    return JSON.parse(text) as T;
+  } catch (e) {
+    warnOnce(`${site} JSON`, String(e));
+    return null;
+  }
+}
+
+// ── Windows: one long-lived PowerShell ─────────────────────────────────────
+// powershell.exe costs ~0.3s CPU just to start, and the poll needs several
+// queries. One session reads one-line scripts from stdin; each reply ends at
+// a unique marker. Requests run one at a time (queue). A script that throws
+// warns once and yields ""; a hung one kills the session (the next request
+// starts a fresh one) — the same never-throw contract as runCmd.
+type PsSession = {
+  child: Deno.ChildProcess;
+  w: WritableStreamDefaultWriter<Uint8Array>;
+  r: ReadableStreamDefaultReader<string>;
+  buf: string;
+};
+let psSession: PsSession | null = null;
+let psQueue: Promise<unknown> = Promise.resolve();
+let psSeq = 0;
+
+function psOpen(): PsSession {
+  const child = new Deno.Command("powershell", {
+    args: [
+      "-NoLogo",
+      "-NoProfile",
+      "-NonInteractive",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-Command",
+      "-",
+    ],
+    stdin: "piped",
+    stdout: "piped",
+    stderr: "null",
+  }).spawn();
+  // Not unref()'d: an unref'd child's pipe reads don't hold the event loop,
+  // so an awaited reply could be dropped. aio exits via Deno.exit, which
+  // closes stdin — PowerShell ends on that EOF.
+  const s: PsSession = {
+    child,
+    w: child.stdin.getWriter(),
+    r: child.stdout.pipeThrough(new TextDecoderStream()).getReader(),
+    buf: "",
+  };
+  // Stop: a failing cmdlet throws into the per-request catch (fail loud);
+  // optional probes opt out with -ErrorAction SilentlyContinue.
+  s.w.write(enc.encode(
+    "$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'; $WarningPreference='SilentlyContinue'; $VerbosePreference='SilentlyContinue'; [Console]::OutputEncoding=[Text.Encoding]::UTF8\n",
+  )).catch(() => {}); // a dead session surfaces on the first request
+  return s;
+}
+
+async function psShut(s: PsSession): Promise<void> {
+  if (psSession === s) psSession = null;
+  try {
+    s.child.kill("SIGKILL");
+  } catch { /* already exited */ }
+  await Promise.allSettled([s.w.close(), s.r.cancel(), s.child.status]);
+}
+
+/** Run a one-line PowerShell script in the shared session; "" on failure. */
+export function pwsh(script: string, timeoutMs = 10_000): Promise<string> {
+  const site = `powershell ${script.slice(0, 48)}…`;
+  const run = async (): Promise<string> => {
+    let s: PsSession;
+    try {
+      s = psSession ??= psOpen();
+    } catch (e) {
+      warnOnce(
+        "powershell",
+        e instanceof Deno.errors.NotFound ? "not installed" : String(e),
+      );
+      return "";
+    }
+    const end = `__machine_end_${++psSeq}__`;
+    const work = (async () => {
+      // The marker goes on its own line: a parse error skips the whole
+      // script line, and the missing __machine_ok__ then says so.
+      await s.w.write(enc.encode(
+        `try { ${script} } catch { Write-Output ('__machine_err__ ' + $_) }; Write-Output '__machine_ok__'\nWrite-Output '${end}'\n`,
+      ));
+      let i: number;
+      while ((i = s.buf.indexOf(end)) < 0) {
+        const { value, done } = await s.r.read();
+        if (done) throw new Error("session exited");
+        s.buf += value;
+      }
+      const out = s.buf.slice(0, i);
+      s.buf = s.buf.slice(i + end.length).replace(/^\r?\n/, "");
+      return out;
+    })();
+    work.catch(() => {}); // a timed-out read rejects after the race is over
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const out = await Promise.race([
+        work,
+        new Promise<null>((r) => timer = setTimeout(() => r(null), timeoutMs)),
+      ]);
+      if (out === null) {
+        warnOnce(site, `timed out after ${timeoutMs}ms`);
+        await psShut(s);
+        return "";
+      }
+      const err = out.match(/__machine_err__ (.*)/);
+      if (err || !out.includes("__machine_ok__")) {
+        warnOnce(site, err?.[1] ?? "script did not run (parse error?)");
+        return "";
+      }
+      return out.replace("__machine_ok__", "").replace(/\r/g, "").trim();
+    } catch (e) {
+      warnOnce(site, String(e));
+      await psShut(s);
+      return "";
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+  const p = psQueue.then(run); // run never rejects — the queue never breaks
+  psQueue = p;
+  return p;
+}
+
+/** Release host resources (the PowerShell session) — for tests and exit. */
+export async function closeHost(): Promise<void> {
+  await psQueue;
+  if (psSession) await psShut(psSession);
+}
+
+// ── Win/OSX: native per-core CPU tick counters (FFI) ───────────────────────
+// The 1s sampler must not start a process per tick. Windows'
+// NtQuerySystemInformation and macOS' host_processor_info return per-core
+// user/kernel/idle ticks; procStat() shapes them as /proc/stat lines so all
+// three OSes share the cell's delta math. No allocation per Windows call;
+// macOS hands back a buffer we vm_deallocate every time.
+export type Ticks = { user: number; sys: number; idle: number };
+
+/** /proc/stat-shaped text: aggregate line, then cpuN (field 4 = idle). */
+export function procStat(cores: Ticks[]): string {
+  if (cores.length === 0) return "";
+  const line = (name: string, t: Ticks) =>
+    `${name} ${t.user} 0 ${t.sys} ${t.idle}`;
+  const sum = cores.reduce((a, t) => ({
+    user: a.user + t.user,
+    sys: a.sys + t.sys,
+    idle: a.idle + t.idle,
+  }), { user: 0, sys: 0, idle: 0 });
+  return [line("cpu ", sum), ...cores.map((t, i) => line(`cpu${i}`, t))]
+    .join("\n");
+}
+
+function winTicks(): () => Ticks[] {
+  const lib = Deno.dlopen("ntdll.dll", {
+    NtQuerySystemInformation: {
+      parameters: ["u32", "buffer", "u32", "buffer"],
+      result: "i32",
+    },
+  });
+  // SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION: 48 bytes per logical CPU
+  // (IdleTime, KernelTime ⊇ idle, UserTime as 100ns i64s, then DPC/IRQ).
+  const buf = new Uint8Array(48 * Math.max(64, navigator.hardwareConcurrency));
+  const len = new Uint32Array(1);
+  const v = new DataView(buf.buffer);
+  return () => {
+    const st = lib.symbols.NtQuerySystemInformation(8, buf, buf.length, len);
+    if (st !== 0) {
+      throw new Error(`NtQuerySystemInformation 0x${(st >>> 0).toString(16)}`);
+    }
+    return Array.from({ length: (len[0] ?? 0) / 48 }, (_, i) => {
+      const idle = Number(v.getBigInt64(i * 48, true));
+      const kernel = Number(v.getBigInt64(i * 48 + 8, true));
+      return {
+        user: Number(v.getBigInt64(i * 48 + 16, true)),
+        sys: kernel - idle,
+        idle,
+      };
+    });
+  };
+}
+
+function macTicks(): () => Ticks[] {
+  const lib = Deno.dlopen("/usr/lib/libSystem.B.dylib", {
+    mach_host_self: { parameters: [], result: "u32" },
+    host_processor_info: {
+      parameters: ["u32", "i32", "buffer", "buffer", "buffer"],
+      result: "i32",
+    },
+    vm_deallocate: { parameters: ["u32", "usize", "usize"], result: "i32" },
+    mach_task_self_: { type: "u32" },
+  });
+  const host = lib.symbols.mach_host_self();
+  const task = lib.symbols.mach_task_self_;
+  const cpus = new Uint32Array(1);
+  const info = new BigUint64Array(1);
+  const words = new Uint32Array(1);
+  return () => {
+    // PROCESSOR_CPU_LOAD_INFO = 2 → per CPU: user, system, idle, nice ticks
+    const kr = lib.symbols.host_processor_info(host, 2, cpus, info, words);
+    if (kr !== 0) throw new Error(`host_processor_info kr=${kr}`);
+    const addr = info[0] ?? 0n;
+    try {
+      const t = new Uint32Array(
+        Deno.UnsafePointerView.getArrayBuffer(
+          Deno.UnsafePointer.create(addr)!,
+          (words[0] ?? 0) * 4,
+        ).slice(0),
+      );
+      return Array.from({ length: cpus[0] ?? 0 }, (_, i) => ({
+        user: (t[i * 4] ?? 0) + (t[i * 4 + 3] ?? 0),
+        sys: t[i * 4 + 1] ?? 0,
+        idle: t[i * 4 + 2] ?? 0,
+      }));
+    } finally {
+      lib.symbols.vm_deallocate(task, addr, BigInt((words[0] ?? 0) * 4));
+    }
+  };
+}
+
+let readTicks: (() => Ticks[]) | null | undefined; // undefined = not opened
+function nativeTicks(): Ticks[] {
+  if (readTicks === undefined) {
+    try {
+      readTicks = PLATFORM === "windows" ? winTicks() : macTicks();
+    } catch (e) {
+      warnOnce("cpu ticks (ffi)", String(e));
+      readTicks = null;
+    }
+  }
+  if (!readTicks) return [];
+  try {
+    return readTicks();
+  } catch (e) {
+    warnOnce("cpu ticks", String(e));
+    return [];
+  }
+}
+
+// ── Win/OSX: static inventory (read once) ──────────────────────────────────
+// Everything that never changes while the app runs, in ONE query per OS:
+// CPU, board/firmware, memory modules, GPUs (+VRAM), OS name. Mapped by pure
+// functions (exported for tests) into the shapes the panels expect.
+export type Inventory = {
+  cpu: { model: string; threads: number; max_mhz: number };
+  // sys_board input order: name, vendor, version, bios vendor, bios version,
+  // bios date, product
+  board: string[];
+  dimms: { list: DimmInfo[]; slots_total: number };
+  gpus: { name: string; vram_mb: number }[];
+  os_name: string;
+};
+const NO_INVENTORY: Inventory = {
+  cpu: { model: "", threads: 0, max_mhz: 0 },
+  board: [],
+  dimms: { list: [], slots_total: 0 },
+  gpus: [],
+  os_name: "",
+};
+
+const str = (v: unknown): string =>
+  typeof v === "string" ? v.trim() : typeof v === "number" ? String(v) : "";
+
+// SMBIOS memory type codes (Win32_PhysicalMemory.SMBIOSMemoryType)
+const SMBIOS_MEM: Record<number, string> = {
+  18: "DDR",
+  19: "DDR2",
+  20: "DDR2 FB-DIMM",
+  24: "DDR3",
+  26: "DDR4",
+  27: "LPDDR",
+  28: "LPDDR2",
+  29: "LPDDR3",
+  30: "LPDDR4",
+  34: "DDR5",
+  35: "LPDDR5",
+};
+
+const gb = (bytes: number) => `${Math.round(bytes / 2 ** 30)} GB`;
+
+type WinInv = {
+  cpu?: string;
+  threads?: number;
+  mhz?: number;
+  bn?: string;
+  bv?: string;
+  bver?: string;
+  biv?: string;
+  bivr?: string;
+  bd?: string;
+  model?: string;
+  os?: string;
+  slots?: number;
+  mem?: { l?: string; c?: string; s?: number; t?: number }[];
+  gpu?: { n?: string; r?: string }[];
+};
+export function winInventory(j: WinInv): Inventory {
+  return {
+    cpu: {
+      model: str(j.cpu),
+      threads: j.threads ?? 0,
+      max_mhz: j.mhz ?? 0,
+    },
+    board: [j.bn, j.bv, j.bver, j.biv, j.bivr, j.bd, j.model].map(str),
+    dimms: {
+      list: toArr(j.mem).map((m) => ({
+        locator: str(m.l),
+        size: gb(Number(m.c) || 0),
+        speed: m.s ? `${m.s} MT/s` : "",
+        type: SMBIOS_MEM[m.t ?? 0] ?? "",
+      })),
+      slots_total: j.slots ?? 0,
+    },
+    gpus: toArr(j.gpu).map((g) => ({
+      name: str(g.n),
+      vram_mb: Math.round((Number(g.r) || 0) / 2 ** 20),
+    })),
+    os_name: str(j.os),
+  };
+}
+
+const WIN_INVENTORY = [
+  "$p=@(Get-CimInstance Win32_Processor)",
+  "$b=Get-CimInstance Win32_BaseBoard",
+  "$bi=Get-CimInstance Win32_BIOS",
+  "$cs=Get-CimInstance Win32_ComputerSystem",
+  "$os=Get-CimInstance Win32_OperatingSystem",
+  "$mem=@(Get-CimInstance Win32_PhysicalMemory | ForEach-Object { @{l=$_.DeviceLocator; c=[string]$_.Capacity; s=$_.ConfiguredClockSpeed; t=$_.SMBIOSMemoryType} })",
+  "$slots=(Get-CimInstance Win32_PhysicalMemoryArray | Measure-Object MemoryDevices -Sum).Sum",
+  // AdapterRAM is a uint32 (caps at 4 GiB); the driver's qwMemorySize is not
+  "$vr=@{}; Get-ChildItem 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}' -ErrorAction SilentlyContinue | ForEach-Object { $q=Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue; if ($q.'HardwareInformation.qwMemorySize') { $vr[[string]$q.DriverDesc]=[string]$q.'HardwareInformation.qwMemorySize' } }",
+  "$gpu=@(Get-CimInstance Win32_VideoController | ForEach-Object { @{n=$_.Name; r=$(if ($vr[[string]$_.Name]) { $vr[[string]$_.Name] } else { [string]$_.AdapterRAM })} })",
+  "ConvertTo-Json -Compress -Depth 4 -InputObject @{cpu=$p[0].Name; threads=($p | Measure-Object NumberOfLogicalProcessors -Sum).Sum; mhz=$p[0].MaxClockSpeed; bn=$b.Product; bv=$b.Manufacturer; bver=$b.Version; biv=$bi.Manufacturer; bivr=$bi.SMBIOSBIOSVersion; bd=$(if ($bi.ReleaseDate) { $bi.ReleaseDate.ToString('yyyy-MM-dd') } else { '' }); model=$cs.Model; os=$os.Caption; slots=$slots; mem=$mem; gpu=$gpu}",
+].join("; ");
+
+const sizeMb = (s: string): number => {
+  const m = s.match(/([\d.]+)\s*(GB|MB)/i);
+  return m
+    ? Math.round(parseFloat(m[1] ?? "0") * (/g/i.test(m[2] ?? "") ? 1024 : 1))
+    : 0;
+};
+
+type Rec = Record<string, unknown>;
+export function macInventory(ctl: string, prof: string, sw: string): Inventory {
+  const ctlKey = (k: string) =>
+    ctl.match(new RegExp(`^${k.replaceAll(".", "\\.")}:\\s*(.+)$`, "m"))?.[1]
+      ?.trim() ?? "";
+  const p = parseJson<Record<string, Rec[]>>("system_profiler", prof) ?? {};
+  const hw = p.SPHardwareDataType?.[0] ?? {};
+  const mem = p.SPMemoryDataType ?? [];
+  // Intel Macs list slots under _items; Apple Silicon has one unified entry
+  const slots = mem.flatMap((m) => toArr(m._items as Rec[] | undefined));
+  const swKey = (k: string) =>
+    sw.match(new RegExp(`^${k}:\\s*(.+)$`, "m"))?.[1]?.trim() ?? "";
+  return {
+    cpu: {
+      model: ctlKey("machdep.cpu.brand_string") || str(hw.chip_type),
+      threads: parseInt(ctlKey("hw.logicalcpu")) || 0,
+      max_mhz: (parseInt(ctlKey("hw.cpufrequency_max")) || 0) / 1e6,
+    },
+    board: [
+      str(hw.machine_model),
+      "Apple",
+      "",
+      "Apple",
+      str(hw.boot_rom_version),
+      "",
+      str(hw.machine_name),
+    ],
+    dimms: slots.length > 0
+      ? {
+        list: slots
+          .filter((d) => str(d.dimm_size) && !/empty/i.test(str(d.dimm_size)))
+          .map((d) => ({
+            locator: str(d._name),
+            size: str(d.dimm_size),
+            speed: str(d.dimm_speed),
+            type: str(d.dimm_type),
+          })),
+        slots_total: slots.length,
+      }
+      : {
+        list: mem.filter((m) => str(m.SPMemoryDataType)).map((m) => ({
+          locator: "unified",
+          size: str(m.SPMemoryDataType),
+          speed: "",
+          type: str(m.dimm_type),
+        })),
+        slots_total: 0,
+      },
+    gpus: (p.SPDisplaysDataType ?? []).map((g) => ({
+      name: str(g.sppci_model) || str(g._name),
+      vram_mb: sizeMb(str(g.spdisplays_vram)),
+    })),
+    os_name: `${swKey("ProductName")} ${swKey("ProductVersion")}`.trim(),
+  };
+}
+
+const inventory = onceOk<Inventory>(async () => {
+  if (PLATFORM === "windows") {
+    const j = parseJson<WinInv>("inventory", await pwsh(WIN_INVENTORY, 60_000));
+    return j?.cpu ? winInventory(j) : null;
+  }
+  if (PLATFORM !== "darwin") return null;
+  const [ctl, prof, sw] = await Promise.all([
+    // the Intel-only key goes last: an unknown oid must not hide the others
+    runCmd([
+      "sysctl",
+      "machdep.cpu.brand_string",
+      "hw.logicalcpu",
+      "hw.cpufrequency_max",
+    ]),
+    runCmd([
+      "system_profiler",
+      "-json",
+      "SPHardwareDataType",
+      "SPMemoryDataType",
+      "SPDisplaysDataType",
+    ], { timeoutMs: 30_000 }),
+    runCmd(["sw_vers"]),
+  ]);
+  const inv = macInventory(ctl, prof, sw);
+  return inv.cpu.model ? inv : null;
+}, NO_INVENTORY);
+
 // gather hwmon into a textual block: "name\ntempN_input\n..." per device,
 // separated by a blank line so WASM parsers can delimit one device from the
 // next (sys_board reads temps until the blank line).
@@ -318,7 +771,8 @@ async function readHwmonBlock(
 // WASM parser via `call`. Never throws: a missing wasm or a failed parse
 // resolves to null, so the UI shows degraded state instead of crashing.
 // Platform-aware: Linux reads /sys + /proc + lspci/lsusb/ip; Windows uses
-// wmic/Get-* PowerShell; OSX uses system_profiler/ioreg/networksetup.
+// FFI tick counters + one long-lived PowerShell; OSX uses FFI +
+// sysctl/system_profiler/ioreg/netstat.
 
 export async function cpu(): Promise<CpuInfo | null> {
   if (PLATFORM !== "linux") return cpuNonLinux();
@@ -333,69 +787,48 @@ export async function cpu(): Promise<CpuInfo | null> {
   return call<CpuInfo>("sys_cpu", [cpuinfo, stat, hwmon]);
 }
 
-// Windows/OSX: synthesize a cpuinfo-like text + a stat line the Rust parser
-// can read. util_pct is derived from a single sample on these platforms
-// (PowerShell Get-Counter / top -l 1) and stamped onto the parsed CpuInfo.
 // Linux /proc/cpuinfo model+cores are static; per-sample reads skip it.
 const cpuinfoOnce = memo(Infinity, () => readFile("/proc/cpuinfo"));
 
-// Win/OSX: synthesize cpuinfo once — one "processor" line per logical core so
-// the Rust parser (which counts "processor" occurrences) reports the right
-// number.
-const cpuinfoNonLinux = memo(Infinity, async () => {
-  const [name = "", cores = ""] = PLATFORM === "windows"
-    ? (await runCmd([
-      "powershell",
-      "-NoProfile",
-      "-Command",
-      "$p=Get-CimInstance Win32_Processor; $p[0].Name; ($p | Measure-Object NumberOfLogicalProcessors -Sum).Sum",
-    ])).split("\n").map((l) => l.trim())
-    : await Promise.all([
-      runCmd(["sysctl", "-n", "machdep.cpu.brand_string"]),
-      runCmd(["sysctl", "-n", "hw.logicalcpu"]),
-    ]);
+// Win/OSX: per-core ticks via FFI (no process per tick) + a cpuinfo-like
+// text from the inventory — one "processor" line per logical core (the Rust
+// parser counts them).
+async function cpuNonLinux(): Promise<CpuInfo | null> {
+  const { cpu } = await inventory();
+  const ticks = nativeTicks();
+  const tempC = cpuTempWin();
+  // count what the counters report (NtQuery sees one ≤64-CPU group)
   const procLines = Array.from(
-    { length: Math.max(1, parseInt(cores) || 1) },
+    { length: Math.max(1, ticks.length || cpu.threads) },
     (_, i) => `processor       : ${i}`,
   ).join("\n");
-  return `model name      : ${name}\n${procLines}\n`;
-});
-
-async function cpuNonLinux(): Promise<CpuInfo | null> {
-  const cpuinfo = await cpuinfoNonLinux();
-  if (PLATFORM === "windows") {
-    // One spawn per sample: util line, then ACPI thermal zone in tenths of
-    // Kelvin (root/wmi, admin-only → empty line otherwise).
-    const [util = "", tenthsK = ""] = (await runCmd([
-      "powershell",
-      "-NoProfile",
-      "-Command",
-      "(Get-Counter '\\Processor(_Total)\\% Processor Time').CounterSamples.CookedValue; (Get-CimInstance -Namespace root/wmi MSAcpi_ThermalZoneTemperature -ErrorAction SilentlyContinue | Select-Object -First 1).CurrentTemperature",
-    ])).split("\n").map((l) => l.trim());
-    const k = parseFloat(tenthsK);
-    // hwmon-style block the parser matches: "core" name + millidegrees C
-    const hwmon = k > 0 ? `core\n${Math.round(k * 100 - 273150)}\n` : "";
-    const r = await call<CpuInfo>("sys_cpu", [
-      cpuinfo,
-      `cpu ${util || "0"}`,
-      hwmon,
-    ]);
-    if (r) r.util_pct = Math.max(0, Math.min(100, parseFloat(util) || 0));
-    return r;
-  }
-  // darwin — top's first sample is since-boot, not an interval: take the 2nd
-  const util = await runCmd([
-    "sh",
-    "-c",
-    "top -l 2 -s 1 -n 0 | grep 'CPU usage' | tail -1",
+  // hwmon-style block the parser matches: "core" name + millidegrees C
+  const hwmon = tempC > 0 ? `core\n${Math.round(tempC * 1000)}\n` : "";
+  return call<CpuInfo>("sys_cpu", [
+    `model name      : ${cpu.model}\n${procLines}\n`,
+    procStat(ticks),
+    hwmon,
   ]);
-  // "CPU usage: 12.5% user, 5.2% sys, 82.3% idle" → extract idle → util = 100-idle
-  const idleMatch = util.match(/([\d.]+)%\s*idle/);
-  const utilPct = idleMatch ? (100 - parseFloat(idleMatch[1] ?? "0")) : 0;
-  const stat = `cpu ${utilPct}`;
-  const r = await call<CpuInfo>("sys_cpu", [cpuinfo, stat, ""]);
-  if (r) r.util_pct = Math.max(0, Math.min(100, utilPct));
-  return r;
+}
+
+// Windows ACPI thermal zone (tenths of Kelvin) — admin-only, and often a
+// board zone, but the only unprivileged-API reading there is. macOS has no
+// unprivileged sensor API (powermetrics needs root) → 0 = "—".
+// Never awaited by the 1s sampler (the session queue may be busy with a slow
+// scan): returns the last reading and refreshes it in the background ≤ 5s.
+let winTemp = { c: 0, at: 0, busy: false };
+function cpuTempWin(): number {
+  if (PLATFORM !== "windows") return 0;
+  if (!winTemp.busy && Date.now() - winTemp.at >= 5_000) {
+    winTemp = { ...winTemp, busy: true };
+    pwsh(
+      "[int](Get-CimInstance -Namespace root/wmi MSAcpi_ThermalZoneTemperature -ErrorAction SilentlyContinue | Select-Object -First 1).CurrentTemperature",
+    ).then((v) => {
+      const k = parseInt(v);
+      winTemp = { c: k > 0 ? k / 10 - 273.15 : 0, at: Date.now(), busy: false };
+    });
+  }
+  return winTemp.c;
 }
 
 export async function mem(): Promise<MemInfo | null> {
@@ -430,7 +863,7 @@ export const dimms = memo(Infinity, dimmsUncached);
 async function dimmsUncached(): Promise<
   { list: DimmInfo[]; slots_total: number }
 > {
-  if (PLATFORM !== "linux") return { list: [], slots_total: 0 }; // Win/OSX TODO
+  if (PLATFORM !== "linux") return (await inventory()).dimms;
   const raw = await runCmd(["dmidecode", "-t", "memory"]);
   if (
     !raw || raw.includes("Permission denied") || raw.includes("requires root")
@@ -442,45 +875,17 @@ async function dimmsUncached(): Promise<
   return { list: result ?? [], slots_total };
 }
 
+// Win/OSX: the OS's own figures (Deno asks the kernel directly — no spawn).
 async function memNonLinux(): Promise<MemInfo | null> {
-  if (PLATFORM === "windows") {
-    const total = await runCmd([
-      "powershell",
-      "-NoProfile",
-      "-Command",
-      "[math]::Ceiling((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1024)",
-    ]);
-    const free = await runCmd([
-      "powershell",
-      "-NoProfile",
-      "-Command",
-      "[math]::Ceiling((Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory / 1)",
-    ]);
-    // synthesize meminfo format the Rust parser reads
-    const totalKb = parseInt(total) || 0;
-    const freeKb = parseInt(free) || 0;
-    const info =
-      `MemTotal:       ${totalKb} kB\nMemAvailable:   ${freeKb} kB\n`;
-    const r = await call<MemInfo>("sys_mem", [info]);
-    if (r) r.temp_c = 0; // no cheap per-module temp on Windows
-    return r;
-  }
-  // darwin — vm_stat returns pages; sysctl hw.memsize for total
-  const totalBytes = await runCmd(["sysctl", "-n", "hw.memsize"]);
-  const vmstat = await runCmd(["vm_stat"]);
-  const pageSizeMatch = vmstat.match(/page size of (\d+) bytes/);
-  const pageSize = parseInt(pageSizeMatch?.[1] ?? "4096");
-  // reclaimable = free + inactive + speculative + purgeable pages
-  const freePages = [
-    ...vmstat.matchAll(
-      /Pages (?:free|inactive|speculative|purgeable):\s+(\d+)/g,
-    ),
-  ].reduce((a, m) => a + (parseInt(m[1] ?? "0") || 0), 0);
-  const freeKb = Math.floor((freePages * pageSize) / 1024);
-  const totalKb = Math.floor((parseInt(totalBytes) || 0) / 1024);
-  const info = `MemTotal:       ${totalKb} kB\nMemAvailable:   ${freeKb} kB\n`;
-  const r = await call<MemInfo>("sys_mem", [info]);
-  if (r) r.temp_c = 0; // no cheap per-module temp on macOS
+  const m = Deno.systemMemoryInfo();
+  // Deno 2.9 on Windows reports available=0; its `free` is ullAvailPhys —
+  // the OS's own "available" (CI-verified)
+  const avail = PLATFORM === "windows" ? m.free : m.available;
+  const kb = (b: number) => Math.round(b / 1024);
+  const r = await call<MemInfo>("sys_mem", [
+    `MemTotal:       ${kb(m.total)} kB\nMemAvailable:   ${kb(avail)} kB\n`,
+  ]);
+  if (r) r.temp_c = 0; // no unprivileged per-module temps on Win/OSX
   return r;
 }
 
@@ -528,44 +933,12 @@ async function usbPortCount(): Promise<number> {
   return n;
 }
 
-// Win/OSX board data has no live temps — static, fetch once.
-const boardNonLinux = memo(Infinity, boardNonLinuxUncached);
-async function boardNonLinuxUncached(): Promise<BoardInfo | null> {
-  if (PLATFORM === "windows") {
-    const get = async (cls: string, prop: string) =>
-      (await runCmd([
-        "powershell",
-        "-NoProfile",
-        "-Command",
-        `(Get-CimInstance ${cls}).${prop}`,
-      ])).trim();
-    const r = await call<BoardInfo>("sys_board", [
-      await get("Win32_BaseBoard", "Product"),
-      await get("Win32_BaseBoard", "Manufacturer"),
-      await get("Win32_BaseBoard", "Version"),
-      await get("Win32_BIOS", "Manufacturer"),
-      await get("Win32_BIOS", "SMBIOSBIOSVersion"),
-      await get("Win32_BIOS", "ReleaseDate"),
-      await get("Win32_ComputerSystem", "Model"),
-      "",
-    ]);
-    if (r) r.usb_ports = 0; // no cheap port count on Windows; UI shows "—"
-    return r;
-  }
-  // darwin — system_profiler SPHardwareDataType gives board + BIOS-ish data
-  const hw = (await runCmd(["system_profiler", "SPHardwareDataType"])).trim();
-  const line = (re: RegExp) => hw.match(re)?.[1]?.trim() ?? "";
-  const r = await call<BoardInfo>("sys_board", [
-    line(/Model Identifier:\s*(.+)/),
-    line(/Manufacturer:\s*(.+)/),
-    "",
-    "Apple",
-    line(/Boot ROM Version:\s*(.+)/),
-    "",
-    line(/Model Name:\s*(.+)/),
-    "",
-  ]);
-  if (r) r.usb_ports = 0; // no cheap port count on OSX; UI shows "—"
+// Win/OSX board data is static (no live temps) — from the inventory.
+async function boardNonLinux(): Promise<BoardInfo | null> {
+  const { board } = await inventory();
+  if (board.length === 0) return null;
+  const r = await call<BoardInfo>("sys_board", [...board, ""]);
+  if (r) r.usb_ports = 0; // no cheap port count on Win/OSX; UI shows "—"
   return r;
 }
 
@@ -624,29 +997,63 @@ export async function gpu(): Promise<GpuInfo | null> {
     } catch (e) {
       ioErr("/sys/class/drm", e);
     }
-  } else if (PLATFORM === "windows") {
-    // Windows: nvidia-smi covers NVIDIA; AMD/Intel via wmic
-    const amd = await runCmd([
-      "powershell",
-      "-NoProfile",
-      "-Command",
-      "Get-CimInstance Win32_VideoController | Select-Object Name,CurrentBitsPerPixel | Format-List",
-    ]);
-    if (amd && !nvidia) {
-      for (const line of amd.split("\n")) {
-        const m = line.match(/Name\s*:\s*(.+)/);
-        if (m) hw += `${(m[1] ?? "").trim()}\n0\n0\n0\n`;
-      }
-    }
-  } else if (PLATFORM === "darwin") {
-    // OSX: system_profiler SPDisplaysDataType
-    const disp = await runCmd(["system_profiler", "SPDisplaysDataType"]);
-    for (const line of disp.split("\n")) {
-      const m = line.match(/^\s*Chipset Model:\s*(.+)/);
-      if (m) hw += `${(m[1] ?? "").trim()}\n0\n0\n0\n`;
-    }
+  } else {
+    // Win/OSX: names + VRAM from the inventory (NVIDIA cards already came
+    // from nvidia-smi); utilization is a live read.
+    const others = (await inventory()).gpus.filter((g) =>
+      !(nvidia && /nvidia/i.test(g.name))
+    );
+    const util = await gpuUtilNonLinux(others.length, nvidia !== "");
+    hw = others.map((g, i) => `${g.name}\n0\n${util[i] ?? 0}\n0\n`).join("");
+    const r = await call<GpuInfo>("sys_gpu", [nvidia, hw]);
+    // hwmon-block GPUs follow the nvidia-smi ones; stamp their VRAM size
+    const first = (r?.gpus.length ?? 0) - others.length;
+    others.forEach((g, i) => {
+      const out = r?.gpus[first + i];
+      if (out) out.mem_total_mb = g.vram_mb;
+    });
+    return r;
   }
   return call<GpuInfo>("sys_gpu", [nvidia, hw]);
+}
+
+// a WMI perf-class query is not free — at most every 5s
+const winGpuUtil = memo(5_000, async () =>
+  Math.min(
+    100,
+    parseInt(
+      await pwsh(
+        "[int](Get-CimInstance Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngine -ErrorAction SilentlyContinue | Where-Object Name -like '*engtype_3D' | Measure-Object UtilizationPercentage -Sum).Sum",
+      ),
+    ) || 0,
+  ));
+
+// Non-NVIDIA GPU utilization %, one entry per inventory GPU (in order) —
+// only where it can be attributed: Windows' 3D-engine counter sums every
+// adapter, so it is used when there is exactly one GPU in the box; macOS'
+// IOAccelerator lists one "Device Utilization %" per GPU.
+async function gpuUtilNonLinux(
+  n: number,
+  hasNvidia: boolean,
+): Promise<number[]> {
+  if (n === 0) return [];
+  if (PLATFORM === "windows") {
+    return n === 1 && !hasNvidia ? [await winGpuUtil()] : [];
+  }
+  const io = await runCmd([
+    "ioreg",
+    "-r",
+    "-d",
+    "1",
+    "-w",
+    "0",
+    "-c",
+    "IOAccelerator",
+  ]);
+  const u = [...io.matchAll(/"Device Utilization %"=(\d+)/g)].map((m) =>
+    Math.min(100, parseInt(m[1] ?? "0") || 0)
+  );
+  return u.length === n ? u : n === 1 && u.length > 0 ? [Math.max(...u)] : [];
 }
 
 export async function disk(): Promise<DiskInfo | null> {
@@ -656,38 +1063,52 @@ export async function disk(): Promise<DiskInfo | null> {
     return call<DiskInfo>("sys_disk", [df]);
   }
   if (PLATFORM === "windows") {
-    // Windows: Get-Volume returns size/free; synthesize df -P format
-    const out = await runCmd([
-      "powershell",
-      "-NoProfile",
-      "-Command",
-      "Get-Volume | Where-Object { $_.DriveLetter -and $_.Size } | ForEach-Object { '{0} {1} {2}' -f $_.DriveLetter,$_.Size,$_.SizeRemaining }",
-    ]);
-    // reformat into df -P columns: Filesystem 1B-blocks Used Available Capacity% MountedOn
-    // (the parser treats mount "C:" as root)
-    const lines = out.split("\n").filter(Boolean).map((l) => {
-      const [letter, sizeS, freeS] = l.trim().split(/\s+/);
-      const size = Number(sizeS) || 0;
-      const free = Number(freeS) || 0;
-      const pct = size ? ((size - free) / size * 100).toFixed(1) : "0";
-      return `${letter}: ${size} ${size - free} ${free} ${pct}% ${letter}:`;
-    }).join("\n");
-    return call<DiskInfo>("sys_disk", [lines]);
+    return call<DiskInfo>("sys_disk", [await winVolumes()]);
   }
-  // darwin — df -g works but in GB blocks; use -k for kB
-  const df = await runCmd(["df", "-l", "-P", "-k"]);
-  // convert kB df to B for consistent units: multiply size/used/avail by 1024
-  const lines = df.split("\n").map((l) => {
-    const cols = l.split(/\s+/);
-    if (cols.length < 6 || cols[1] === "1024-blocks") return l;
-    const [totalB, usedB, availB] = [1, 2, 3].map((i) =>
-      (parseInt(cols[i] ?? "0") || 0) * 1024
-    );
-    return `${cols[0]} ${totalB} ${usedB} ${availB} ${cols[4]} ${
-      cols.slice(5).join(" ")
-    }`;
-  }).join("\n");
-  return call<DiskInfo>("sys_disk", [lines]);
+  return call<DiskInfo>("sys_disk", [
+    macDf(await runCmd(["df", "-l", "-P", "-k"])),
+  ]);
+}
+
+// Volume fill changes slowly — Windows re-reads every 10s. Synthesizes
+// `df -P` columns (Filesystem 1B-blocks Used Available Capacity Mounted);
+// the parser treats mount "C:" as root.
+const winVolumes = memo(10_000, async () =>
+  (await pwsh(
+    "Get-Volume | Where-Object { $_.DriveLetter -and $_.Size } | ForEach-Object { '{0} {1} {2}' -f $_.DriveLetter,$_.Size,$_.SizeRemaining }",
+  )).split("\n").filter((l) => l.trim()).map((l) => {
+    const [letter, sizeS, freeS] = l.trim().split(/\s+/);
+    const size = Number(sizeS) || 0;
+    const free = Number(freeS) || 0;
+    const pct = size ? ((size - free) / size * 100).toFixed(1) : "0";
+    return `${letter}: ${size} ${size - free} ${free} ${pct}% ${letter}:`;
+  }).join("\n"));
+
+/**
+ * macOS `df -P -k` → byte columns, APFS-aware: "/" is the sealed read-only
+ * system snapshot (a few GB used) while the user's files live on
+ * /System/Volumes/Data — report that as "/", and drop the other system
+ * volumes (VM, Preboot, Update…) that share the same container.
+ */
+export function macDf(df: string): string {
+  const rows = df.split("\n").map((l) => l.split(/\s+/)).filter((c) =>
+    c.length >= 6 && /^\d+$/.test(c[1] ?? "")
+  ).map((c) => ({ c, mp: c.slice(5).join(" ") }));
+  const hasData = rows.some((r) => r.mp === "/System/Volumes/Data");
+  return rows
+    .filter((r) =>
+      !(r.mp.startsWith("/System/Volumes/") &&
+        r.mp !== "/System/Volumes/Data") &&
+      !(hasData && r.mp === "/")
+    )
+    .map(({ c, mp }) => {
+      const [total, used, avail] = [1, 2, 3].map((i) =>
+        (parseInt(c[i] ?? "0") || 0) * 1024
+      );
+      return `${c[0]} ${total} ${used} ${avail} ${c[4]} ${
+        mp === "/System/Volumes/Data" ? "/" : mp
+      }`;
+    }).join("\n");
 }
 
 // `lspci -nnmm`-style line the Rust parser reads: slot "class" "vendor" "name"
@@ -702,33 +1123,83 @@ async function lspciUncached(): Promise<LspciEntry[] | null> {
     return call<LspciEntry[]>("sys_lspci", [raw]);
   }
   if (PLATFORM === "windows") {
-    // Win32_PnPEntity filtered to PCI devices, tab-separated class/vendor/name
-    const out = await runCmd([
-      "powershell",
-      "-NoProfile",
-      "-Command",
-      "Get-CimInstance Win32_PnPEntity | Where-Object { $_.PNPDeviceID -like 'PCI\\*' } | ForEach-Object { \"$($_.PNPClass)`t$($_.Manufacturer)`t$($_.Name)\" }",
-    ]);
-    const lines = out.split("\n").filter((l) => l.trim())
-      .map((l) => mmLine(l.split("\t"))).join("\n");
-    return call<LspciEntry[]>("sys_lspci", [lines]);
+    return call<LspciEntry[]>("sys_lspci", [winPnp(await winDevices()).pci]);
   }
   // darwin — system_profiler JSON (often empty on Apple Silicon → [])
-  const out = await runCmd(["system_profiler", "-json", "SPPCIDataType"]);
-  let devs: Record<string, string>[] = [];
-  try {
-    devs = out ? JSON.parse(out).SPPCIDataType ?? [] : [];
-  } catch (e) {
-    warnOnce("system_profiler SPPCIDataType", String(e));
-  }
+  const out = await runCmd(["system_profiler", "-json", "SPPCIDataType"], {
+    timeoutMs: 15_000,
+  });
+  const devs = parseJson<{ SPPCIDataType?: Rec[] }>("SPPCIDataType", out)
+    ?.SPPCIDataType ?? [];
   const lines = devs.map((d) =>
     mmLine([
-      d["sppci_device_type"] ?? "",
-      d["sppci_vendor-id"] ?? "",
-      d["_name"] ?? "",
+      str(d["sppci_device_type"]),
+      str(d["sppci_vendor"]) || str(d["sppci_vendor-id"]),
+      str(d["_name"]),
     ])
   ).join("\n");
   return call<LspciEntry[]>("sys_lspci", [lines]);
+}
+
+// Windows: ONE Win32_PnPEntity scan (slow, ~1s) feeds both lspci and lsusb.
+type PnpDev = { id?: string; c?: string; v?: string; n?: string };
+const winDevices = memo(30_000, async () =>
+  toArr(parseJson<PnpDev | PnpDev[]>(
+    "Win32_PnPEntity",
+    await pwsh(
+      "ConvertTo-Json -Compress -InputObject @(Get-CimInstance Win32_PnPEntity | Where-Object { $_.PNPDeviceID -like 'PCI\\*' -or $_.PNPDeviceID -like 'USB\\VID_*' } | ForEach-Object { @{id=[string]$_.PNPDeviceID; c=[string]$_.PNPClass; v=[string]$_.Manufacturer; n=[string]$_.Name} })",
+      20_000,
+    ),
+  )));
+
+/** PnP devices → `lspci -nnmm` / `lsusb` text. USB interface children
+ *  (`&MI_xx`) collapse into their device; ids are real VID:PID. */
+export function winPnp(devs: PnpDev[]): { pci: string; usb: string } {
+  const usb = new Set<string>();
+  const pci: string[] = [];
+  for (const d of devs) {
+    const id = str(d.id).toUpperCase();
+    if (id.startsWith("PCI\\")) {
+      pci.push(mmLine([str(d.c), str(d.v), str(d.n)]));
+      continue;
+    }
+    const m = id.match(/^USB\\VID_([0-9A-F]{4})&PID_([0-9A-F]{4})(&MI_)?/);
+    if (m && !m[3]) {
+      usb.add(
+        `Bus 000 Device 000: ID ${m[1]!.toLowerCase()}:${m[2]!.toLowerCase()} ${
+          str(d.n)
+        }`,
+      );
+    }
+  }
+  return { pci: pci.join("\n"), usb: [...usb].join("\n") };
+}
+
+/** system_profiler USB JSON (SPUSBDataType or Sonoma+ SPUSBHostDataType;
+ *  key names differ) → `lsusb` text: any node with a name + vendor/product
+ *  id is a device; buses and hubs without ids are skipped. */
+export function macUsb(json: string): string {
+  const out = new Set<string>();
+  const hex = (v: unknown) =>
+    v === "apple_vendor_id" // Apple's own devices carry no hex vendor id
+      ? "05ac"
+      : typeof v === "number"
+      ? v.toString(16).padStart(4, "0")
+      : str(v).match(/0x([0-9a-f]{1,4})/i)?.[1]?.toLowerCase().padStart(4, "0");
+  const walk = (v: unknown): void => {
+    if (Array.isArray(v)) return v.forEach(walk);
+    if (!v || typeof v !== "object") return;
+    const o = v as Rec;
+    const key = (re: RegExp) => Object.keys(o).find((k) => re.test(k));
+    const vid = hex(o[key(/vendor_?id$/i) ?? ""]);
+    const pid = hex(o[key(/product_?id$/i) ?? ""]);
+    if (vid && pid && str(o._name)) {
+      out.add(`Bus 000 Device 000: ID ${vid}:${pid} ${str(o._name)}`);
+    }
+    Object.values(o).forEach(walk);
+  };
+  walk(parseJson("system_profiler USB", json));
+  return [...out].join("\n");
 }
 
 export const lsusb = memo(30_000, lsusbUncached);
@@ -738,26 +1209,15 @@ async function lsusbUncached(): Promise<LsusbEntry[] | null> {
     return call<LsusbEntry[]>("sys_lsusb", [raw]);
   }
   if (PLATFORM === "windows") {
-    const out = await runCmd([
-      "powershell",
-      "-NoProfile",
-      "-Command",
-      "Get-CimInstance Win32_PnPEntity | Where-Object { $_.PNPClass -eq 'USB' } | Select-Object -ExpandProperty Name",
-    ]);
-    // synthesize lsusb format: "Bus 001 Dev 001: ID 0000:0000 Name"
-    const lines = out.split("\n").filter(Boolean).map((l) =>
-      `Bus 001 Device 001: ID 0000:0000 ${l.trim()}`
-    ).join("\n");
-    return call<LsusbEntry[]>("sys_lsusb", [lines]);
+    return call<LsusbEntry[]>("sys_lsusb", [winPnp(await winDevices()).usb]);
   }
-  // darwin — system_profiler SPUSBDataType
-  const out = await runCmd(["system_profiler", "SPUSBDataType"]);
-  // the Rust parser expects lsusb format; extract device names heuristically
-  const lines = out.split("\n").map((l) => {
-    const m = l.match(/^\s*(.+?):\s*$/);
-    return m ? `Bus 001 Device 001: ID 0000:0000 ${m[1]}` : "";
-  }).filter(Boolean).join("\n");
-  return call<LsusbEntry[]>("sys_lsusb", [lines]);
+  const out = await runCmd([
+    "system_profiler",
+    "-json",
+    "SPUSBDataType",
+    "SPUSBHostDataType",
+  ], { timeoutMs: 15_000 });
+  return call<LsusbEntry[]>("sys_lsusb", [macUsb(out)]);
 }
 
 export async function net(): Promise<NetInfo | null> {
@@ -771,52 +1231,157 @@ export async function net(): Promise<NetInfo | null> {
     const speedInfo = await readNetSpeed(route);
     return call<NetInfo>("sys_net", [addrs, links, route, fw, speedInfo]);
   }
+  const speed = (iface: string, link: number, rx: number, tx: number) =>
+    JSON.stringify({
+      link_max_mbps: link,
+      rx_mbps: rx, // raw byte counters — the cell turns them into rates
+      tx_mbps: tx,
+      iface,
+      ts: Date.now(),
+    });
   if (PLATFORM === "windows") {
-    const addrs = await runCmd([
-      "powershell",
-      "-NoProfile",
-      "-Command",
-      "Get-NetIPAddress | Select-Object InterfaceAlias,IPAddress,AddressFamily | ConvertTo-Json",
+    const st = await winNetState();
+    if (!st) return null;
+    const n = winNet(st);
+    // by index, not name: stdin is not UTF-8, a non-ASCII name would garble
+    const [rx = 0, tx = 0] = st.idx
+      ? (await pwsh(
+        `$s=Get-NetAdapter -InterfaceIndex ${
+          Number(st.idx)
+        } | Get-NetAdapterStatistics; "$($s.ReceivedBytes) $($s.SentBytes)"`,
+      )).split(" ").map((v) => Number(v) || 0)
+      : [];
+    return call<NetInfo>("sys_net", [
+      JSON.stringify(n.addrs),
+      n.vpn ? VPN_LINK : "[]",
+      n.route,
+      n.fw,
+      speed(n.iface, n.linkMbps, rx, tx),
     ]);
-    const route = await runCmd(["route", "print", "0.0.0.0"]);
-    const fwState = await runCmd([
-      "powershell",
-      "-NoProfile",
-      "-Command",
-      "(Get-NetFirewallProfile | Where-Object Enabled).Count",
-    ]);
-    const fw = `defender:${parseInt(fwState) > 0 ? "active" : "inactive"}`;
-    const vpn = addrs.includes("WAN") || addrs.includes("RAS");
-    const links = vpn ? '[{"ifname":"tun0","operstate":"UP"}]' : "[]";
-    const speedInfo = readNetSpeedWindows();
-    return call<NetInfo>("sys_net", [addrs, links, route, fw, speedInfo]);
   }
-  // darwin — ifconfig text → `ip -j -br addr`-shaped JSON array
-  const ifconfig = await runCmd(["ifconfig"]);
-  const ifaces = ifconfig.split(/\n(?=\S)/).filter(Boolean).map((b) => ({
-    ifname: b.split(":")[0] ?? "",
-    addr_info: [...b.matchAll(/\binet6?\s+(\S+)/g)].map((m) => ({
-      local: m[1],
-    })),
-  }));
-  const route = await runCmd(["netstat", "-rn", "-f", "inet"]);
-  const pf = await runCmd(["pfctl", "-s", "info"]);
-  const fw = `pf:${pf.includes("Status: Enabled") ? "active" : "inactive"}`;
+  // darwin
+  const [ifconfig, route, fw] = await Promise.all([
+    runCmd(["ifconfig"]),
+    runCmd(["route", "-n", "get", "default"]),
+    macFirewall(),
+  ]);
+  const dev = route.match(/interface:\s*(\S+)/)?.[1] ?? "";
+  const gw = route.match(/gateway:\s*(\S+)/)?.[1] ?? "";
+  const ifaces = macIfaces(ifconfig);
   // system utunN tunnels (iCloud etc.) carry only IPv6 — a VPN has IPv4
   const vpn = ifaces.some((i) =>
     /^(utun|ppp|ipsec)/.test(i.ifname) &&
     i.addr_info.some((a) => a.local?.includes("."))
   );
-  const links = vpn ? '[{"ifname":"tun0","operstate":"UP"}]' : "[]";
-  const speedInfo = readNetSpeedDarwin();
+  const [rx, tx] = dev
+    ? macBytes(await runCmd(["netstat", "-ibn", "-I", dev]))
+    : [0, 0];
   return call<NetInfo>("sys_net", [
     JSON.stringify(ifaces),
-    links,
-    route,
+    vpn ? VPN_LINK : "[]",
+    gw ? `default via ${gw} dev ${dev}` : "",
     fw,
-    speedInfo,
+    speed(dev, ifaces.find((i) => i.ifname === dev)?.link ?? 0, rx, tx),
   ]);
 }
+
+// A tunnel the Rust parser recognizes as "VPN up" (Win/OSX detect it host-side)
+const VPN_LINK = '[{"ifname":"tun0","operstate":"UP"}]';
+
+// Windows adapters/IPs/route/firewall change rarely — re-read every 10s;
+// only the byte counters are read per poll.
+export type WinNetState = {
+  addrs?: unknown;
+  gw?: string;
+  dev?: string;
+  idx?: number;
+  fw?: number;
+};
+type WinAdapter = {
+  ifname?: string;
+  operstate?: string;
+  desc?: string;
+  speed?: string;
+  addr_info?: { local?: string } | { local?: string }[];
+};
+const winNetState = memo(10_000, async () =>
+  parseJson<WinNetState>(
+    "net",
+    await pwsh(
+      [
+        "$r=Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Sort-Object RouteMetric | Select-Object -First 1",
+        "$ips=@(Get-NetIPAddress -ErrorAction SilentlyContinue)",
+        "$a=@(Get-NetAdapter | ForEach-Object { $i=$_.ifIndex; @{ifname=$_.Name; operstate=$(if ($_.Status -eq 'Up') { 'UP' } else { 'DOWN' }); desc=$_.InterfaceDescription; speed=[string]$_.Speed; addr_info=@($ips | Where-Object InterfaceIndex -eq $i | ForEach-Object { @{local=$_.IPAddress} })} })",
+        "ConvertTo-Json -Compress -Depth 5 -InputObject @{addrs=$a; gw=$(if ($r) { $r.NextHop } else { '' }); dev=$(if ($r) { $r.InterfaceAlias } else { '' }); idx=$(if ($r) { $r.ifIndex } else { 0 }); fw=@(Get-NetFirewallProfile | Where-Object Enabled).Count}",
+      ].join("; "),
+      20_000,
+    ), // first call autoloads 3 CDXML modules
+  ));
+
+// Full-tunnel VPN clients by adapter description (mesh overlays such as
+// Tailscale/ZeroTier don't carry all traffic — not counted, as on Linux).
+const VPN_DESC =
+  /wireguard|wintun|tap-windows|openvpn|anyconnect|pangp|fortinet|nordlynx|mullvad|\bvpn\b/i;
+
+/** Windows adapter state → the `ip -j -br addr` shape + route/fw strings. */
+export function winNet(st: WinNetState) {
+  const ad = toArr(st.addrs as WinAdapter | WinAdapter[] | undefined);
+  const dev = str(st.dev);
+  return {
+    addrs: ad.map((a) => ({
+      ifname: str(a.ifname),
+      operstate: str(a.operstate),
+      addr_info: toArr(a.addr_info).map((x) => ({ local: str(x.local) })),
+    })),
+    vpn: ad.some((a) =>
+      a.operstate === "UP" && VPN_DESC.test(`${a.ifname} ${a.desc ?? ""}`)
+    ),
+    route: st.gw ? `default via ${st.gw} dev ${dev}` : "",
+    fw: `defender:${(st.fw ?? 0) > 0 ? "active" : "inactive"}`,
+    iface: dev,
+    linkMbps: Math.round(
+      (Number(ad.find((a) => a.ifname === dev)?.speed) || 0) / 1e6,
+    ),
+  };
+}
+
+/** macOS `ifconfig` → `ip -j -br addr`-shaped interfaces (+ link Mbps from
+ *  the wired media line, e.g. "(1000baseT" / "(10Gbase-T"). */
+export function macIfaces(ifconfig: string) {
+  return ifconfig.split(/\n(?=\S)/).filter(Boolean).map((b) => {
+    const m = b.match(/media:.*?\((\d+)(G?)base/);
+    return {
+      ifname: b.split(":")[0] ?? "",
+      operstate: /status: inactive/.test(b) || !/<UP[,>]/.test(b)
+        ? "DOWN"
+        : "UP",
+      addr_info: [...b.matchAll(/\binet6?\s+(\S+)/g)].map((x) => ({
+        local: (x[1] ?? "").replace(/%.*$/, ""), // fe80::1%lo0 → fe80::1
+      })),
+      link: m ? parseInt(m[1] ?? "0") * (m[2] ? 1000 : 1) : 0,
+    };
+  });
+}
+
+/** `netstat -ibn -I <if>` → [rx, tx] bytes from the <Link#> row. Counted
+ *  from the right (…Ibytes Opkts Oerrs Obytes Coll): tunnels have no
+ *  Address column. */
+export function macBytes(netstat: string): [number, number] {
+  const c = netstat.split("\n").find((l) => l.includes("<Link#"))?.trim()
+    .split(/\s+/) ?? [];
+  return c.length >= 7
+    ? [Number(c[c.length - 5]) || 0, Number(c[c.length - 2]) || 0]
+    : [0, 0];
+}
+
+// Application firewall state needs no root (pfctl -s info does).
+const macFirewall = memo(10_000, async () => {
+  const out = await runCmd([
+    "/usr/libexec/ApplicationFirewall/socketfilterfw",
+    "--getglobalstate",
+  ]);
+  return out ? `macOS:${/enabled/i.test(out) ? "active" : "inactive"}` : "none";
+});
 
 // Network speed: read link max (Mbps) from /sys/class/net/IFACE/speed and
 // rx/tx byte counters from /sys/class/net/IFACE/statistics. The cell computes
@@ -845,28 +1410,18 @@ async function readNetSpeed(route: string): Promise<string> {
   });
 }
 
-function readNetSpeedWindows(): string {
-  // Windows: Get-NetAdapterStats; approximate with current link speed only
-  return JSON.stringify({ link_max_mbps: 0, rx_mbps: 0, tx_mbps: 0 });
-}
-
-function readNetSpeedDarwin(): string {
-  // OSX: netstat -i gives counters; link speed from networksetup
-  return JSON.stringify({ link_max_mbps: 0, rx_mbps: 0, tx_mbps: 0 });
-}
-
 // ── sys: host identity + live vitals (uptime, load, freq, swap) ────────────
-// Cheap host-side reads (no WASM parser needed): /proc/uptime, /proc/loadavg,
-// /proc/cpuinfo MHz, cpufreq max, /proc/meminfo swap. Pure best-effort — every
-// field defaults to 0/"" and never throws, so non-Linux and locked-down boxes
-// degrade to an empty-but-valid struct (kata: never an error).
+// Uptime/swap/load come from Deno (the kernel, no spawn) on every OS; Linux
+// adds /proc + cpufreq reads. Best-effort — 0/"" means "unavailable".
 export async function sys(): Promise<SysInfo> {
+  const mi = Deno.systemMemoryInfo();
   const base: SysInfo = {
     hostname: "",
     kernel: "",
     arch: Deno.build.arch,
     os: PLATFORM,
-    uptime_s: 0,
+    os_name: "",
+    uptime_s: Deno.osUptime(),
     load1: 0,
     load5: 0,
     load15: 0,
@@ -874,19 +1429,38 @@ export async function sys(): Promise<SysInfo> {
     procs_total: 0,
     cpu_mhz: 0,
     cpu_max_mhz: 0,
-    swap_total_kb: 0,
-    swap_used_kb: 0,
+    swap_total_kb: Math.round(mi.swapTotal / 1024),
+    swap_used_kb: Math.round(Math.max(0, mi.swapTotal - mi.swapFree) / 1024),
     reboot_required: false,
     governor: "",
   };
   try {
     base.hostname = Deno.hostname();
-  } catch { /* no --allow-sys */ }
+  } catch (e) {
+    warnOnce("hostname", String(e));
+  }
   try {
     base.kernel = Deno.osRelease();
-  } catch { /* ignore */ }
-  if (PLATFORM !== "linux") return base;
+  } catch (e) {
+    warnOnce("osRelease", String(e));
+  }
+  // Windows has no load average (Deno reports zeros) — the UI hides it there
+  if (PLATFORM !== "windows") {
+    [base.load1 = 0, base.load5 = 0, base.load15 = 0] = Deno.loadavg();
+  }
+  if (PLATFORM !== "linux") {
+    const inv = await inventory();
+    base.os_name = inv.os_name;
+    base.cpu_max_mhz = inv.cpu.max_mhz;
+    if (PLATFORM === "windows") {
+      base.reboot_required = await winRebootPending();
+      [base.swap_total_kb, base.swap_used_kb] = await winSwapKb();
+    }
+    return base;
+  }
 
+  base.os_name = (await osReleaseOnce()).match(/^PRETTY_NAME="?([^"\n]*)/m)
+    ?.[1] ?? "";
   // Debian/Ubuntu drop this file when a package (often the kernel) needs a
   // reboot to take effect — a cheap "pending updates" security/health signal.
   for (const p of ["/run/reboot-required", "/var/run/reboot-required"]) {
@@ -897,14 +1471,8 @@ export async function sys(): Promise<SysInfo> {
     } catch { /* not present */ }
   }
 
-  const uptime = await readFile("/proc/uptime");
-  base.uptime_s = parseFloat(uptime.split(/\s+/)[0] ?? "0") || 0;
-
-  const load = (await readFile("/proc/loadavg")).trim().split(/\s+/);
-  base.load1 = parseFloat(load[0] ?? "0") || 0;
-  base.load5 = parseFloat(load[1] ?? "0") || 0;
-  base.load15 = parseFloat(load[2] ?? "0") || 0;
-  const procs = (load[3] ?? "").split("/");
+  const procs = ((await readFile("/proc/loadavg")).trim().split(/\s+/)[3] ?? "")
+    .split("/");
   base.procs_running = parseInt(procs[0] ?? "0") || 0;
   base.procs_total = parseInt(procs[1] ?? "0") || 0;
 
@@ -920,15 +1488,25 @@ export async function sys(): Promise<SysInfo> {
   base.governor = (await readFile(
     "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor",
   )).trim();
-
-  const meminfo = await readFile("/proc/meminfo");
-  const swTotal = parseInt(meminfo.match(/SwapTotal:\s*(\d+)/)?.[1] ?? "0") ||
-    0;
-  const swFree = parseInt(meminfo.match(/SwapFree:\s*(\d+)/)?.[1] ?? "0") || 0;
-  base.swap_total_kb = swTotal;
-  base.swap_used_kb = Math.max(0, swTotal - swFree);
   return base;
 }
+
+const osReleaseOnce = memo(Infinity, () => readFile("/etc/os-release"));
+
+// Deno's Windows swap figures are garbage (CI: total 3087007 B, free 0) —
+// read the page files (MB) instead, every 10s.
+const winSwapKb = memo(10_000, async (): Promise<[number, number]> => {
+  const [total = 0, used = 0] = (await pwsh(
+    '$p=@(Get-CimInstance Win32_PageFileUsage); "$([int]($p | Measure-Object AllocatedBaseSize -Sum).Sum) $([int]($p | Measure-Object CurrentUsage -Sum).Sum)"',
+  )).split(" ").map((v) => (Number(v) || 0) * 1024);
+  return [total, used];
+});
+
+// Windows Update parks this key until the pending reboot happens.
+const winRebootPending = memo(60_000, async () =>
+  (await pwsh(
+    "Test-Path 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\WindowsUpdate\\Auto Update\\RebootRequired'",
+  )) === "True");
 
 // "<backend>:active|inactive" | "none", root-free. ufw.service stays
 // "active" even when ufw is disabled, so ufw also needs ENABLED=yes. A bare
@@ -1049,39 +1627,38 @@ async function secUncached(): Promise<SecInfo | null> {
     return call<SecInfo>("sys_sec", [ss, ps, sysctl, sshd, facts]);
   }
   if (PLATFORM === "windows") {
-    // netstat -ano LISTENING rows → synthesized ss rows (no process names —
-    // resolving PIDs would need one query per row).
-    const netstat = await runCmd(["netstat", "-ano"]);
-    const ss = netstat.split("\n")
-      .filter((l) => l.includes("LISTENING"))
-      .map((l) => {
-        const c = l.trim().split(/\s+/);
-        return `tcp LISTEN 0 0 ${c[1] ?? ""} *:*`;
-      }).join("\n");
-    const sb = await runCmd([
-      "powershell",
-      "-NoProfile",
-      "-Command",
-      "Confirm-SecureBootUEFI",
-    ]);
-    const facts = `secureboot ${
-      sb.includes("True")
-        ? "enabled"
-        : sb.includes("False")
-        ? "disabled"
-        : "unknown"
-    }`;
-    return call<SecInfo>("sys_sec", [ss, "", "", "", facts]);
+    const j = parseJson<WinSecState>(
+      "sec",
+      await pwsh(
+        [
+          "$pn=@{}; Get-Process | ForEach-Object { $pn[[int]$_.Id]=$_.ProcessName }",
+          "$t=@(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | ForEach-Object { @{p='tcp'; a=$_.LocalAddress; o=$_.LocalPort; n=[string]$pn[[int]$_.OwningProcess]} })",
+          "$u=@(Get-NetUDPEndpoint -ErrorAction SilentlyContinue | ForEach-Object { @{p='udp'; a=$_.LocalAddress; o=$_.LocalPort; n=[string]$pn[[int]$_.OwningProcess]} })",
+          // registry state is readable without admin (Confirm-SecureBootUEFI is not)
+          "$sb=(Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\SecureBoot\\State' -ErrorAction SilentlyContinue).UEFISecureBootEnabled",
+          // the shell's BitLocker property needs no admin (manage-bde does)
+          "$bl=try { (New-Object -ComObject Shell.Application).NameSpace($env:SystemDrive + '\\').Self.ExtendedProperty('System.Volume.BitLockerProtection') } catch { $null }",
+          "$av=try { (Get-MpComputerStatus).RealTimeProtectionEnabled } catch { $null }",
+          "ConvertTo-Json -Compress -Depth 3 -InputObject @{ports=($t + $u); sb=$sb; bl=$bl; av=$av}",
+        ].join("; "),
+        20_000,
+      ),
+    );
+    if (!j) return null;
+    const w = winSec(j);
+    return call<SecInfo>("sys_sec", [w.ss, "", "", "", w.facts]);
   }
   // darwin — lsof for listeners, csrutil (SIP), fdesetup (FileVault)
-  const lsof = await runCmd(["lsof", "-iTCP", "-sTCP:LISTEN", "-P", "-n"]);
+  const [lsof, sip, fv] = await Promise.all([
+    runCmd(["lsof", "-iTCP", "-sTCP:LISTEN", "-P", "-n"]),
+    runCmd(["csrutil", "status"]),
+    runCmd(["fdesetup", "status"]),
+  ]);
   const ss = lsof.split("\n").slice(1).map((l) => {
     const c = l.trim().split(/\s+/);
     const addr = c[8] ?? "";
     return c.length > 8 ? `tcp LISTEN 0 0 ${addr} *:* users:(("${c[0]}"))` : "";
   }).filter(Boolean).join("\n");
-  const sip = await runCmd(["csrutil", "status"]);
-  const fv = await runCmd(["fdesetup", "status"]);
   const facts = [
     // SIP ≈ the closest analog to Secure Boot's "tampered boot chain" check
     `secureboot ${
@@ -1092,8 +1669,41 @@ async function secUncached(): Promise<SecInfo | null> {
         : "unknown"
     }`,
     `luks ${fv.includes("On") ? "1" : fv.includes("Off") ? "0" : "-1"}`,
+    "crypt FileVault",
   ].join("\n");
   return call<SecInfo>("sys_sec", [ss, "", "", "", facts]);
+}
+
+export type WinSecState = {
+  ports?: { p?: string; a?: string; o?: number; n?: string }[];
+  sb?: number | null;
+  bl?: number | null;
+  av?: boolean | null;
+};
+
+/** Windows listeners + posture → `ss -tulnpH` rows and sys_sec facts.
+ *  BitLockerProtection: 1 on · 2 off · 3 encrypting · 4 decrypting ·
+ *  5 suspended · 6 locked; anything else (null: no BitLocker) = unknown. */
+export function winSec(j: WinSecState): { ss: string; facts: string } {
+  const ss = toArr(j.ports).map((p) => {
+    const a = str(p.a);
+    const n = str(p.n);
+    return `${p.p} ${p.p === "tcp" ? "LISTEN" : "UNCONN"} 0 0 ${
+      a.includes(":") ? `[${a}]` : a
+    }:${p.o} *:*${n ? ` users:(("${n}"))` : ""}`;
+  }).join("\n");
+  const bl = j.bl ?? -1;
+  return {
+    ss,
+    facts: [
+      `secureboot ${
+        j.sb === 1 ? "enabled" : j.sb === 0 ? "disabled" : "unknown"
+      }`,
+      `luks ${[1, 3, 5, 6].includes(bl) ? 1 : [2, 4].includes(bl) ? 0 : -1}`,
+      "crypt BitLocker",
+      j.av === true ? "av on" : j.av === false ? "av off" : "",
+    ].filter(Boolean).join("\n"),
+  };
 }
 
 // ── collectAll: run every syscall in parallel, return one bundle ───────────

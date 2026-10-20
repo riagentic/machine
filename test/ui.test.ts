@@ -12,6 +12,11 @@ import { testUI } from "aio/testing";
 import { assert, assertExists } from "@std/assert";
 import { machine } from "../src/wasm.ts";
 import App from "../src/App.tsx";
+// Tests that refresh end with closeHost() (Windows' PowerShell session).
+import { closeHost } from "../src/io.server.ts";
+
+// A cold Windows refresh runs several CIM queries in a row — allow for it.
+const SLOW = { timeoutMs: 60_000 };
 
 testUI(App, "boots with header, brand, and refresh button", async (ui) => {
   await ui.settle();
@@ -34,12 +39,14 @@ testUI(
     // which can take ~300ms, so poll with waitFor rather than one-shot
     // expectCell.
     ui.App.RefreshButton.click();
-    await ui.waitFor(() => machine.lastRefresh > 0, { timeoutMs: 5000 });
+    await ui.waitFor(() => machine.lastRefresh > 0, SLOW);
     // App is still responsive: the button is still on the surface.
     assertExists(
       ui.App.RefreshButton,
       "RefreshButton still present after refresh",
     );
+    await ui.settle(); // incl. the CPU sample a forced refresh schedules
+    await closeHost();
   },
 );
 
@@ -79,7 +86,7 @@ testUI(
   "concurrent refresh and refreshCpu both commit without conflict",
   async (ui) => {
     // Wait out the boot refresh so the baseline below is stable.
-    await ui.waitFor(() => !machine.refreshing, { timeoutMs: 8000 });
+    await ui.waitFor(() => !machine.refreshing, SLOW);
     const before = machine.lastRefresh;
     // Fire both without awaiting — overlapping, as the two schedules do live.
     // Forced: a paused cell would otherwise skip the full refresh.
@@ -87,11 +94,13 @@ testUI(
     machine.refreshCpu();
     // lastRefresh ADVANCING proves this refresh committed rather than being
     // discarded (boot alone can't satisfy it).
-    await ui.waitFor(() => machine.lastRefresh > before, { timeoutMs: 8000 });
+    await ui.waitFor(() => machine.lastRefresh > before, SLOW);
     assertExists(
       ui.App.RefreshButton,
       "app still responsive after overlapping refresh + sampler",
     );
+    await ui.settle(); // incl. the CPU sample a forced refresh schedules
+    await closeHost();
   },
 );
 
@@ -133,4 +142,11 @@ testUI(App, "left tabs show one card; All shows every card", async (ui) => {
   await ui.settle();
   const all = ui.html();
   assert(all.includes("MOTHERBOARD") && all.includes("LSUSB"), "all cards");
+  assert(!all.includes("HARDWARE"), "All skips the HW summary");
+  ui.App.HWTabButton.click();
+  await ui.waitFor(() => machine.view === "hw", { timeoutMs: 3000 });
+  await ui.settle();
+  assert(ui.html().includes("HARDWARE"), "HW card");
+  ui.App.AllTabButton.click();
+  await ui.waitFor(() => machine.view === "all", { timeoutMs: 3000 });
 });
