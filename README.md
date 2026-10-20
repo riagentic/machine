@@ -1,63 +1,61 @@
 # machine
 
-Live hardware monitor for your PC — CPU, memory, motherboard, GPU, disks,
-security, network, PCI/USB — in one compact desktop window. Parsers in Rust →
-WebAssembly, app on [Deno](https://deno.com) +
-[aio](https://jsr.io/@riagentic/aio). Linux-first; Windows/macOS via fallbacks.
+Compact live hardware monitor: CPU, memory, board, GPU, disks, security,
+network, PCI/USB in one small desktop window. Rust parsers → WebAssembly, app on
+[Deno](https://deno.com) + [aio](https://github.com/riagentic/aio). Runs on
+**Linux, Windows and macOS** (CI-tested on all three).
 
-![machine — all cards view](docs/screenshot.png)
+<img src="docs/screenshot.png" alt="machine screenshot (demo data)" width="460">
 
 ## Features
 
-- 🧠 **Live vitals** — per-second CPU chart, per-core heat grid, gauges, temps,
-  frequency, load.
-- 🩺 **TODO** — ranks what's not optimal: full disks, hot parts, swap, firewall,
-  open ports, suspicious processes, pending reboot.
-- 🛡️ **Security** — 0–100 posture score, hardening checks, listening ports.
-- 🗂 **Tabs** — one card filling the window, or **All** in as many columns as
-  fit.
-- 📋 **Copy** any card (or everything) as Markdown.
-- 🎨 Dark/light theme · ⏸ pause · ↻ refresh. Never blocks the OS: slow tools are
-  cached, timed out and killed.
+- 🧠 Live per-second CPU chart, per-core heat grid, temps, frequency, load
+- 🧾 **HW** tab: full hardware inventory (CPU, RAM sticks, board/BIOS, GPUs,
+  drives, network, PCI, USB) on one card
+- 🩺 **Todo**: what's not optimal (full disks, heat, swap, firewall, open ports)
+- 🛡️ Security score, hardening checks, listening ports
+- 📋 Copy any card, or everything, as Markdown · 🎨 dark/light · ⏸ pause
+- 🪶 Never slows the PC: no process per tick, slow reads cached and time-limited
 
-## Quick start
+## Run
 
-Needs [Deno](https://deno.com) 2.9+, an aio checkout, and Rust with
-`wasm32-unknown-unknown` (`rustup target add wasm32-unknown-unknown`).
+Needs Deno 2.9+, Rust with `wasm32-unknown-unknown`, and an
+[aio](https://github.com/riagentic/aio) checkout.
 
 ```sh
-git clone <repo-url> machine && cd machine
-mkdir -p dep && ln -s /abs/path/to/aio dep/aio   # the aio framework
-deno task wasm                                  # build the Rust parsers (once)
-deno task dev                                   # run (add --client=browser for a tab)
+git clone https://github.com/riagentic/machine && cd machine
+git clone --branch v1.0.22-beta https://github.com/riagentic/aio dep/aio
+rustup target add wasm32-unknown-unknown
+deno task wasm   # build the parsers (once)
+deno task dev    # run (--client=browser for a tab)
 ```
 
-Optional tools widen coverage: `lspci`, `lsusb`, `ip`, `ss`, `df`, `dmidecode`
-(DIMMs need root), `nvidia-smi`. Without WASM the app runs with a "wasm off"
-badge.
+| Task                | Does                                        |
+| ------------------- | ------------------------------------------- |
+| `deno task test`    | tests (`cd rust && cargo test` for parsers) |
+| `deno task compile` | desktop (Electron) package → `dist/`        |
+| `deno task am`      | app manager: `start`, `surface`, `logs`, …  |
 
-| Task                          | Does                                                 |
-| ----------------------------- | ---------------------------------------------------- |
-| `deno task test`              | Deno tests (`cd rust && cargo test` for the parsers) |
-| `deno task lint`              | `deno lint` + aio linter                             |
-| `deno task compile`           | desktop (Electron) package → `dist/`                 |
-| `deno task build`             | every target in `build.targets`                      |
-| `deno task am <cmd>`          | app manager: `start`, `surface`, `trigger`, `logs`   |
-| `deno task doctor` / `am fix` | config check / repair                                |
+## Per OS
+
+| OS      | Sources                                                     | Not available           |
+| ------- | ----------------------------------------------------------- | ----------------------- |
+| Linux   | `/sys`, `/proc`, `lspci`, `lsusb`, `ip`, `ss`, `dmidecode`¹ | —                       |
+| Windows | native CPU counters + one PowerShell session (CIM/WMI)      | load average, CPU temp² |
+| macOS   | native CPU counters, `sysctl`, `system_profiler`, `ioreg`   | CPU temp (needs root)   |
+
+¹ RAM sticks need root · ² CPU temp needs admin. `nvidia-smi` adds NVIDIA stats.
 
 ## How it works
 
 ```
-schedules (2s full, 1s CPU)  src/app.ts
-  → machine cell methods     src/wasm.ts       browser-safe state + delta math
-  → host I/O (server only)   src/io.server.ts  /sys, /proc, lspci, ip, ss, …
-  → pure parsers text→JSON   rust/src/lib.rs   no fs/process access
-  → UI                       src/App.tsx
+schedules 2s / 1s CPU  src/app.ts
+→ machine cell         src/wasm.ts        state + delta math (browser-safe)
+→ host I/O             src/io.server.ts   per-OS reads, server only
+→ pure parsers         rust/src/lib.rs    text → JSON, no fs/process
+→ UI                   src/App.tsx
 ```
 
-Spec: [`.katana/machine.md`](.katana/machine.md) · agent notes:
-[`AGENTS.md`](AGENTS.md) · changes: [`CHANGELOG.md`](CHANGELOG.md).
-
-## License
-
-[MIT](LICENSE). Not affiliated with Solana — the palette is an homage.
+Spec: [`.katana/machine.md`](.katana/machine.md) ·
+[`CHANGELOG.md`](CHANGELOG.md) · [MIT](LICENSE). Not affiliated with Solana —
+the palette is an homage.

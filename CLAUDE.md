@@ -17,9 +17,11 @@ truth): `.katana/machine.md`. More detail: `AGENTS.md`, aio internals:
   `../../aio`). Never `npm`/`node`.
 - JSX via `jsxImportSource: "aio"`; state via `cell({ state, methods })`
   (methods-only; effects via `s.$do(...)`, own-cell actions via `self()`).
-- aio **1.0.20-beta**, pinned `path:` to the sibling checkout (`.aio/pin.local`,
-  `am pin`). Version = deno.json `"version": "0.2"`; build number from git.
-- Persistence: SQLite (`~/.machine/data`); only `theme` persists
+- aio **1.0.22-beta**, pinned `path:` to the sibling checkout (`.aio/pin.local`,
+  `am pin`); CI checks out the public `riagentic/aio` tag `v1.0.22-beta` into
+  `dep/aio` (`.github/workflows/ci.yml`). Version = deno.json
+  `"version": "0.4"`; build number = git commit count (tag `v0.4.<count>`).
+- Persistence: SQLite (`~/.machine/data`); only `theme` + `view` persist
   (`persist: { include }`). Server-only scratch is hidden via `visible.exclude`.
 - Rust crate `machine-sys` in `rust/`, target `wasm32-unknown-unknown`.
 
@@ -60,8 +62,17 @@ Data flow: schedule (2s poll in `src/app.ts`) → `machine.refresh` cell method
   protocol: host `alloc(len)` → write bytes → `sys_*(ptr,len,…)` → returns ptr
   to 4-byte-LE-length-prefixed UTF-8 → host reads via `str_len(ptr)` →
   `free_str(ptr)` + `dealloc`.
-- Platform detection via `Deno.build.os` in the host layer (Linux:
-  `/sys`,`/proc`; Windows: PowerShell/`wmic`; OSX: `system_profiler`/`sysctl`).
+- Platform detection via `Deno.build.os` in the host layer. Linux: `/sys`,
+  `/proc`, CLI tools. Windows: per-core CPU ticks via FFI
+  (`NtQuerySystemInformation`), everything else through ONE long-lived
+  PowerShell session (`pwsh()`; never spawn `powershell` per query). macOS: CPU
+  ticks via FFI (`host_processor_info`), `sysctl`/`system_profiler`/`ioreg`/
+  `netstat`. Static facts load once (`inventory()`); memory/uptime/swap/load
+  come from `Deno.*` on every OS. Pure mappers (`winNet`, `macDf`, …) are
+  exported and fixture-tested in `test/host.test.ts`; its live test runs on all
+  3 OSes in CI.
+- Tests that call `refresh` must end with `await closeHost()` — on Windows the
+  PowerShell session is an open child process the leak sanitizer flags.
 
 ## aio rules that bite
 

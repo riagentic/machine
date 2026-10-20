@@ -125,7 +125,8 @@ export type SysInfo = {
   hostname: string;
   kernel: string;
   arch: string;
-  os: string;
+  os: string; // "linux" | "windows" | "darwin"
+  os_name: string; // human name: "Ubuntu 24.04 LTS", "Windows 11 Pro", "macOS 15.1"
   uptime_s: number;
   load1: number;
   load5: number;
@@ -149,6 +150,7 @@ export type SysInfo = {
 // Left-bar tabs: "all" shows every card, any other id shows just that card.
 export const VIEWS = [
   "all",
+  "hw",
   "todo",
   "cpu",
   "mem",
@@ -341,16 +343,12 @@ export const machine = cell("machine", {
         const snap = await io.cpu();
         if (!snap) return;
         const live = s.$live!;
-        const hadPrevStat = io.PLATFORM === "linux" && live.prevCpuStat !== "";
-        if (io.PLATFORM === "linux") {
-          snap.util_pct = cpuUtilPct(live.prevCpuStat, snap.stat);
-          live.prevCpuStat = snap.stat;
-          snap.cores_util = coresUtilPct(
-            live.prevCpuCoresStat,
-            snap.core_stats,
-          );
-          live.prevCpuCoresStat = snap.core_stats;
-        }
+        // every OS hands back /proc/stat-shaped tick lines (Win/OSX via FFI)
+        const hadPrevStat = live.prevCpuStat !== "";
+        snap.util_pct = cpuUtilPct(live.prevCpuStat, snap.stat);
+        live.prevCpuStat = snap.stat;
+        snap.cores_util = coresUtilPct(live.prevCpuCoresStat, snap.core_stats);
+        live.prevCpuCoresStat = snap.core_stats;
         s.cpu = snap;
         // keep last 60 samples — .slice() (not spread): live async state
         // doesn't expose Symbol.iterator. Post-await read is safe: this method

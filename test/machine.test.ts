@@ -8,6 +8,16 @@
 import { bootCells, testCell } from "aio/testing";
 import { assert, assertEquals } from "@std/assert";
 import { machine, netRates } from "../src/wasm.ts";
+// Tests that refresh end with closeHost(): on Windows the I/O layer keeps a
+// PowerShell session open, which the leak sanitizer would (rightly) flag.
+import { closeHost } from "../src/io.server.ts";
+
+// A cold Windows refresh (CIM queries) can outlast one settle() budget.
+async function until(cond: () => boolean, ms = 60_000): Promise<void> {
+  for (const end = Date.now() + ms; !cond() && Date.now() < end;) {
+    await new Promise((r) => setTimeout(r, 50));
+  }
+}
 
 testCell(machine, "initial state has all panels empty", (t) => {
   const s = t.getState();
@@ -37,6 +47,7 @@ testCell(machine, "refresh toggles refreshing and never throws", async (t) => {
     s.lastRefresh > 0,
     "lastRefresh must be set after a successful refresh",
   );
+  await closeHost();
 });
 
 Deno.test("paused skips polls; a forced refresh still samples all", async () => {
@@ -49,8 +60,11 @@ Deno.test("paused skips polls; a forced refresh still samples all", async () => 
   assert(machine.cpu === null, "paused sampler must not sample");
   await machine.refresh(true);
   await h.settle(); // runs the schedule.next CPU kick
+  await until(() => machine.cpu !== null);
   assert(machine.lastRefresh > 0, "forced refresh runs while paused");
   assert(machine.cpu !== null, "forced refresh also samples CPU");
+  await h.settle();
+  await closeHost();
 });
 
 Deno.test("resume kicks an immediate refresh", async () => {
@@ -59,7 +73,10 @@ Deno.test("resume kicks an immediate refresh", async () => {
   machine.togglePause();
   await h.settle();
   assert(machine.paused === false);
+  await until(() => machine.lastRefresh > 0);
   assert(machine.lastRefresh > 0, "resume must refresh at once");
+  await h.settle();
+  await closeHost();
 });
 
 testCell(machine, "toggleTheme flips dark ↔ light", async (t) => {

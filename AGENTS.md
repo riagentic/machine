@@ -23,7 +23,7 @@
 
 ## Stack — Deno + aio, NOT Node/npm
 
-- Framework is **aio** (`1.0.20-beta`), vendored via `dep/aio` symlink → sibling
+- Framework is **aio** (`1.0.22-beta`), vendored via `dep/aio` symlink → sibling
   aio checkout (`am pin path:<abs>` records it in `.aio/pin.local`).
 - Runtime: **Deno 2.9+**. All commands are `deno ...`, never `npm`/`node`.
 - App entrypoint pattern (from aio examples/sibling apps): `src/app.ts` imports
@@ -84,8 +84,9 @@
   4-byte-LE-length-prefixed.
 - Prefer reading from `/sys`, `/proc`, `lspci`, `lsusb`, `ip`, etc. on Linux —
   don't shell out from the UI loop; go through the WASM boundary so the app
-  never blocks. Windows uses PowerShell/`wmic`; OSX uses `system_profiler`/
-  `sysctl`/`ifconfig` — platform detected via `Deno.build.os`.
+  never blocks. Windows: FFI CPU ticks + one long-lived PowerShell session
+  (`pwsh()`); OSX: FFI CPU ticks + `sysctl`/`system_profiler`/`ioreg`/ `netstat`
+  — platform detected via `Deno.build.os`. See CLAUDE.md.
 - Build: `deno task wasm` (cargo build → copies
   `rust/target/.../machine_sys.wasm` → `src/syscalls.wasm`). Rust unit tests:
   `cd rust && cargo test`.

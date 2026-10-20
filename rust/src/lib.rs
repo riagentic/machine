@@ -111,7 +111,8 @@ pub extern "C" fn sys_cpu(cpuinfo: *const u8, cpuinfo_len: usize, stat_full: *co
     let model = cpuinfo.lines().find(|l| l.starts_with("model name"))
         .and_then(|l| l.split(':').nth(1).map(|s| s.trim().to_string()))
         .unwrap_or_default();
-    let cores = cpuinfo.matches("processor").count();
+    // line-start only: a model name may contain "processor" ("Common KVM processor")
+    let cores = cpuinfo.lines().filter(|l| l.starts_with("processor")).count();
 
     // CPU temps from hwmon block; host passes lines like "name\ntemp1_input\n..."
     let mut cpu_temp: f64 = 0.0;
@@ -494,7 +495,8 @@ pub extern "C" fn sys_net(
 //   sysctl — "key value" lines the host reads from /proc/sys (missing = skip)
 //   sshd   — raw /etc/ssh/sshd_config ("" = no sshd installed → skip ssh checks)
 //   facts  — "key value" lines: secureboot enabled|disabled|unknown,
-//            luks 1|0|-1, updates N|-1  (-1/unknown = skip the check)
+//            luks 1|0|-1, updates N|-1  (-1/unknown = skip the check),
+//            crypt <scheme name>, av on|off (Windows real-time antivirus)
 // Output: {"ports":[…],"procs":[…],"checks":[…]}. Unknown never false-alarms:
 // a check whose input is missing is OMITTED, not reported as failing.
 
@@ -677,11 +679,20 @@ pub extern "C" fn sys_sec(
             "enable in UEFI — blocks unsigned bootloaders/kernels"),
         _ => {} // unknown → skip, never false-alarm
     }
+    // "crypt" names the scheme (FileVault/BitLocker); Linux omits it → LUKS
+    let crypt = kv_lookup(facts, "crypt").unwrap_or("LUKS");
     match kv_lookup(facts, "luks") {
-        Some("1") => push_check("luks", "Disk encryption", "LUKS", true,
+        Some("1") => push_check("luks", "Disk encryption", crypt, true,
             "encrypted block device present"),
         Some("0") => push_check("luks", "Disk encryption", "none", false,
             "no encrypted volumes — a stolen disk is readable"),
+        _ => {}
+    }
+    match kv_lookup(facts, "av") {
+        Some("on") => push_check("av", "Real-time antivirus", "on", true,
+            "scans files as they are opened"),
+        Some("off") => push_check("av", "Real-time antivirus", "off", false,
+            "turn on real-time protection in Windows Security"),
         _ => {}
     }
     if let Some(n) = kv_lookup(facts, "updates").and_then(|v| v.parse::<i64>().ok()) {
@@ -808,6 +819,17 @@ mod tests {
         assert!(s.contains(r#""cpu1 63"#), "got: {s}");
         // aggregate line is the first line of /proc/stat
         assert!(s.contains(r#""stat":"cpu  123"#), "got: {s}");
+    }
+
+    #[test]
+    fn cpu_cores_ignore_processor_in_model_name() {
+        let cpuinfo = "processor\t: 0\nmodel name\t: Common KVM processor\nprocessor\t: 1\n";
+        let s = out(sys_cpu(
+            cpuinfo.as_ptr(), cpuinfo.len(),
+            std::ptr::null(), 0,
+            std::ptr::null(), 0,
+        ));
+        assert!(s.contains(r#""cores":2"#), "got: {s}");
     }
 
     #[test]
@@ -950,6 +972,13 @@ mod tests {
         assert!(s.contains(r#""id":"updates","label":"Pending updates","value":"4","ok":false"#), "got: {s}");
         // dmesg_restrict was NOT in the input → check must be absent, not failing
         assert!(!s.contains("dmesg"), "missing input must omit the check; got: {s}");
+    }
+
+    #[test]
+    fn sec_names_the_crypt_scheme_and_checks_av() {
+        let s = sec_out("", "", "", "", "luks 1\ncrypt BitLocker\nav off\n");
+        assert!(s.contains(r#""id":"luks","label":"Disk encryption","value":"BitLocker","ok":true"#), "got: {s}");
+        assert!(s.contains(r#""id":"av","label":"Real-time antivirus","value":"off","ok":false"#), "got: {s}");
     }
 
     #[test]
