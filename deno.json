@@ -1,4 +1,5 @@
 {
+  "aioVersion": "v1.0.23-beta",
   "title": "machine",
   "version": "0.4",
   "nodeModulesDir": "auto",
@@ -64,6 +65,7 @@
       "browser",
       "electron",
       "android"
-    ]
+    ],
+    "electronRuntime": "online"
   }
 }

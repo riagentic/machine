@@ -17,10 +17,10 @@ truth): `.katana/machine.md`. More detail: `AGENTS.md`, aio internals:
   `../../aio`). Never `npm`/`node`.
 - JSX via `jsxImportSource: "aio"`; state via `cell({ state, methods })`
   (methods-only; effects via `s.$do(...)`, own-cell actions via `self()`).
-- aio **1.0.22-beta**, pinned `path:` to the sibling checkout (`.aio/pin.local`,
-  `am pin`); CI checks out the public `riagentic/aio` tag `v1.0.22-beta` into
-  `dep/aio` (`.github/workflows/ci.yml`). Version = deno.json
-  `"version": "0.4"`; build number = git commit count (tag `v0.4.<count>`).
+- aio **1.0.23-beta**, pinned in deno.json `aioVersion` (`am pin`); CI checks
+  out the public `riagentic/aio` tag `v1.0.23-beta` into `dep/aio`
+  (`.github/workflows/ci.yml`). Version = deno.json `"version": "0.4"`; build
+  number = git commit count (tag `v0.4.<count>`).
 - Persistence: SQLite (`~/.machine/data`); only `theme` + `view` persist
   (`persist: { include }`). Server-only scratch is hidden via `visible.exclude`.
 - Rust crate `machine-sys` in `rust/`, target `wasm32-unknown-unknown`.
@@ -29,7 +29,8 @@ truth): `.katana/machine.md`. More detail: `AGENTS.md`, aio internals:
 
 - `deno task dev` — run app (`deno task dev --client=browser` for browser)
 - `deno task wasm` (`scripts/wasm.ts`) — build Rust → `src/syscalls.wasm`
-  (required once, else UI shows degraded "wasm off" state)
+  (committed; without cargo/wasm32 the task keeps it and warns — rebuild and
+  commit it after changing `rust/`)
 - `deno task test` — all tests; single file: `deno test -A test/ui.test.ts`
 - `deno run -A dep/aio/aiol/mod.ts .` — aiol, the aio framework linter (flags
   removed config keys / moved imports after aio upgrades)

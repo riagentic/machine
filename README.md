@@ -19,14 +19,15 @@ network, PCI/USB in one small desktop window. Rust parsers → WebAssembly, app 
 
 ## Run
 
-Needs Deno 2.9+, Rust with `wasm32-unknown-unknown`, and an
-[aio](https://github.com/riagentic/aio) checkout.
+Needs Deno 2.9+ and an [aio](https://github.com/riagentic/aio) checkout. Rust
+with `wasm32-unknown-unknown` is only needed to change the parsers:
+`src/syscalls.wasm` is committed, and `deno task wasm` keeps it when cargo is
+missing.
 
 ```sh
 git clone https://github.com/riagentic/machine && cd machine
-git clone --branch v1.0.22-beta https://github.com/riagentic/aio dep/aio
-rustup target add wasm32-unknown-unknown
-deno task wasm   # build the parsers (once)
+git clone --branch v1.0.23-beta https://github.com/riagentic/aio dep/aio
+deno task wasm   # rebuild the parsers (no-op without Rust)
 deno task dev    # run (--client=browser for a tab)
 ```
 

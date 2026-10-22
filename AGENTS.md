@@ -23,7 +23,7 @@
 
 ## Stack — Deno + aio, NOT Node/npm
 
-- Framework is **aio** (`1.0.22-beta`), vendored via `dep/aio` symlink → sibling
+- Framework is **aio** (`1.0.23-beta`), vendored via `dep/aio` symlink → sibling
   aio checkout (`am pin path:<abs>` records it in `.aio/pin.local`).
 - Runtime: **Deno 2.9+**. All commands are `deno ...`, never `npm`/`node`.
 - App entrypoint pattern (from aio examples/sibling apps): `src/app.ts` imports
@@ -88,8 +88,10 @@
   (`pwsh()`); OSX: FFI CPU ticks + `sysctl`/`system_profiler`/`ioreg`/ `netstat`
   — platform detected via `Deno.build.os`. See CLAUDE.md.
 - Build: `deno task wasm` (cargo build → copies
-  `rust/target/.../machine_sys.wasm` → `src/syscalls.wasm`). Rust unit tests:
-  `cd rust && cargo test`.
+  `rust/target/.../machine_sys.wasm` → `src/syscalls.wasm`). The wasm is
+  committed: without cargo (or the wasm32 target) the task keeps it and warns,
+  so clean machines build. Changed `rust/`? Rebuild and commit the wasm. Rust
+  unit tests: `cd rust && cargo test`.
 
 ## Verification order (pre-release / pre-merge)
 

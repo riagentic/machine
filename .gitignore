@@ -5,9 +5,6 @@ node_modules/
 *.AppImage
 AppDir/
 
-# compiled wasm — regenerated via `deno task wasm` (needs Rust + wasm32 target)
-src/syscalls.wasm
-
 # aio runtime state
 .aio/
 .aio-*/
