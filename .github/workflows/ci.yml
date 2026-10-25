@@ -16,7 +16,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: riagentic/aio
-          ref: v1.0.23-beta
+          ref: v1.0.25-beta
           path: dep/aio
       - uses: denoland/setup-deno@v2
         with:

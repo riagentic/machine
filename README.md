@@ -26,7 +26,7 @@ missing.
 
 ```sh
 git clone https://github.com/riagentic/machine && cd machine
-git clone --branch v1.0.23-beta https://github.com/riagentic/aio dep/aio
+git clone --branch v1.0.25-beta https://github.com/riagentic/aio dep/aio
 deno task wasm   # rebuild the parsers (no-op without Rust)
 deno task dev    # run (--client=browser for a tab)
 ```

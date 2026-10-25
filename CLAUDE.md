@@ -13,12 +13,12 @@ truth): `.katana/machine.md`. More detail: `AGENTS.md`, aio internals:
 
 ## Stack
 
-- **Deno 2.9+ + aio framework** (vendored at `dep/aio` → symlink to sibling
-  `../../aio`). Never `npm`/`node`.
+- **Deno 2.9+ + aio framework** (vendored at `dep/aio` → symlink to the
+  provisioned release `~/.local/lib/aio-versions/v1.0.25-beta`). Never `npm`/`node`.
 - JSX via `jsxImportSource: "aio"`; state via `cell({ state, methods })`
   (methods-only; effects via `s.$do(...)`, own-cell actions via `self()`).
-- aio **1.0.23-beta**, pinned in deno.json `aioVersion` (`am pin`); CI checks
-  out the public `riagentic/aio` tag `v1.0.23-beta` into `dep/aio`
+- aio **1.0.25-beta**, pinned in deno.json `aioVersion` (`am pin`); CI checks
+  out the public `riagentic/aio` tag `v1.0.25-beta` into `dep/aio`
   (`.github/workflows/ci.yml`). Version = deno.json `"version": "0.4"`; build
   number = git commit count (tag `v0.4.<count>`).
 - Persistence: SQLite (`~/.machine/data`); only `theme` + `view` persist
