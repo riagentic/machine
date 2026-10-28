@@ -3,7 +3,8 @@
 Compact live hardware monitor: CPU, memory, board, GPU, disks, security,
 network, PCI/USB in one small desktop window. Rust parsers → WebAssembly, app on
 [Deno](https://deno.com) + [aio](https://github.com/riagentic/aio). Runs on
-**Linux, Windows and macOS** (CI-tested on all three).
+**Linux, Windows and macOS**. CI runs format, lint, type check and tests on
+Linux.
 
 <img src="docs/screenshot.png" alt="machine screenshot (demo data)" width="460">
 
