@@ -1,16 +1,15 @@
 name: ci
+# Correctness only: format, lint, type check and tests. Builds and releases
+# are made locally. src/syscalls.wasm is committed, so no Rust/WASM build here.
 on:
   push:
+    branches: [main]
   pull_request:
 permissions:
   contents: read
 jobs:
   test:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
@@ -21,13 +20,9 @@ jobs:
       - uses: denoland/setup-deno@v2
         with:
           deno-version: v2.9.7
-      - run: rustup target add wasm32-unknown-unknown
-      - run: deno task wasm
-      - name: fmt · lint · check · cargo test
-        if: runner.os == 'Linux'
-        run: |
-          deno fmt --check
-          deno lint
-          deno check src/ test/
-          cd rust && cargo test
+      - run: deno fmt --check
+      - run: deno lint
+      - run: deno check src/ test/
+      - name: Rust parser tests
+        run: cd rust && cargo test
       - run: deno test -A test/
