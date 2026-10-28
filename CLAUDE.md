@@ -14,7 +14,8 @@ truth): `.katana/machine.md`. More detail: `AGENTS.md`, aio internals:
 ## Stack
 
 - **Deno 2.9+ + aio framework** (vendored at `dep/aio` → symlink to the
-  provisioned release `~/.local/lib/aio-versions/v1.0.25-beta`). Never `npm`/`node`.
+  provisioned release `~/.local/lib/aio-versions/v1.0.25-beta`). Never
+  `npm`/`node`.
 - JSX via `jsxImportSource: "aio"`; state via `cell({ state, methods })`
   (methods-only; effects via `s.$do(...)`, own-cell actions via `self()`).
 - aio **1.0.25-beta**, pinned in deno.json `aioVersion` (`am pin`); CI checks
